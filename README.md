@@ -12,6 +12,7 @@ control for application code.
 - [Install](#install)
 - [Quick Start](#quick-start)
 - [Handle Controls](#handle-controls)
+- [Timeouts](#timeouts)
 - [Turn Hooks](#turn-hooks)
 - [Events](#events)
 - [History and Resume](#history-and-resume)
@@ -81,6 +82,27 @@ The queue rules are intentionally simple:
 | `abort` | Stops the loop. Completed tool results from the current turn are kept. |
 | `state` | Returns a clone of the committed in-memory Rig message history. |
 | `wait` | Waits for the loop to finish and returns `AgentLoopResult`. |
+
+## Timeouts
+
+Set turn and loop wall-clock timeouts independently:
+
+```rust
+use std::time::Duration;
+
+let agent_loop = AgentLoop::new(agent)
+    .turn_timeout(Duration::from_secs(30))
+    .loop_timeout(Duration::from_secs(120));
+```
+
+`turn_timeout` applies to each active agent turn and resets between turns.
+`loop_timeout` applies to the whole loop lifetime, including idle time while the
+handle is still alive. If both can fire during a turn, the earlier deadline wins.
+
+Timeouts during an active turn commit only valid completed tool-call/tool-result
+pairs, then run `with_turn_hook` with that append batch, which may be empty.
+Active-turn timeouts emit `AgentLoopEvent::TurnTimedOut`. A loop timeout while
+idle ends the loop without running the hook.
 
 ## Turn Hooks
 
@@ -163,6 +185,8 @@ Known end reasons include:
 | `ContextFull` | The provider rejected the request because the context was too large. |
 | `Length` | The provider stopped due to an output limit. |
 | `MaxTurns` | Rig hit the configured multi-turn tool-call limit. |
+| `TurnTimedOut` | The active turn exceeded the configured wall-clock timeout. |
+| `LoopTimedOut` | The loop exceeded the configured wall-clock timeout. |
 | `ToolError` | Tool execution failed. |
 | `ApiError` | The provider/client returned an API error. |
 

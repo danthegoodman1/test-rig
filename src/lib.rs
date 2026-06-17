@@ -2,12 +2,13 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fmt,
-    future::Future,
+    future::{Future, IntoFuture},
     pin::Pin,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use futures::StreamExt;
@@ -25,6 +26,7 @@ use tokio::{
         mpsc::{self, error::TryRecvError},
     },
     task::JoinHandle,
+    time::{Instant, sleep_until},
 };
 
 pub type TurnHookError = Box<dyn Error + Send + Sync + 'static>;
@@ -51,6 +53,8 @@ where
     agent: Arc<Agent<M, P>>,
     app_state: Arc<S>,
     max_turns: usize,
+    turn_timeout: Option<Duration>,
+    loop_timeout: Option<Duration>,
     initial_history: Vec<Message>,
     turn_hook: Option<TurnHook<S>>,
 }
@@ -65,6 +69,8 @@ where
             agent: Arc::new(agent),
             app_state: Arc::new(()),
             max_turns: 100,
+            turn_timeout: None,
+            loop_timeout: None,
             initial_history: Vec::new(),
             turn_hook: None,
         }
@@ -89,6 +95,8 @@ where
             agent: self.agent,
             app_state: Arc::new(app_state),
             max_turns: self.max_turns,
+            turn_timeout: self.turn_timeout,
+            loop_timeout: self.loop_timeout,
             initial_history: self.initial_history,
             turn_hook,
         }
@@ -103,6 +111,18 @@ where
 {
     pub fn max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = max_turns;
+        self
+    }
+
+    /// Set a wall-clock timeout for each active agent turn.
+    pub fn turn_timeout(mut self, timeout: Duration) -> Self {
+        self.turn_timeout = Some(timeout);
+        self
+    }
+
+    /// Set a wall-clock timeout for the whole loop lifetime.
+    pub fn loop_timeout(mut self, timeout: Duration) -> Self {
+        self.loop_timeout = Some(timeout);
         self
     }
 
@@ -164,6 +184,8 @@ where
             self.agent.clone(),
             self.app_state.clone(),
             self.max_turns,
+            self.turn_timeout,
+            self.loop_timeout,
             self.turn_hook.clone(),
             events_tx.clone(),
             state.clone(),
@@ -314,6 +336,10 @@ pub enum EndReason {
     Length { error: ApiErrorInfo },
     /// Rig stopped after exceeding the configured multi-turn tool-call limit.
     MaxTurns { max_turns: usize },
+    /// The active turn exceeded the configured wall-clock timeout.
+    TurnTimedOut { timeout: Duration },
+    /// The loop exceeded the configured wall-clock timeout.
+    LoopTimedOut { timeout: Duration },
     /// The turn failed while using tools.
     ToolError { message: String },
     /// The provider or client returned an API/request/response error.
@@ -393,6 +419,9 @@ pub enum AgentLoopEvent<R> {
     TurnAborted {
         messages: Vec<Message>,
     },
+    TurnTimedOut {
+        messages: Vec<Message>,
+    },
     HistoryReplaced {
         messages: Vec<Message>,
     },
@@ -469,6 +498,65 @@ enum Command {
     Abort,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimeoutKind {
+    Turn,
+    Loop,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimeoutDeadline {
+    kind: TimeoutKind,
+    at: Instant,
+    timeout: Duration,
+}
+
+impl TimeoutDeadline {
+    fn new(kind: TimeoutKind, timeout: Duration) -> Self {
+        Self {
+            kind,
+            at: Instant::now() + timeout,
+            timeout,
+        }
+    }
+
+    fn end_reason(self) -> EndReason {
+        match self.kind {
+            TimeoutKind::Turn => EndReason::TurnTimedOut {
+                timeout: self.timeout,
+            },
+            TimeoutKind::Loop => EndReason::LoopTimedOut {
+                timeout: self.timeout,
+            },
+        }
+    }
+}
+
+fn next_timeout(
+    turn: Option<TimeoutDeadline>,
+    loop_deadline: Option<TimeoutDeadline>,
+) -> Option<TimeoutDeadline> {
+    match (turn, loop_deadline) {
+        (Some(turn), Some(loop_deadline)) if loop_deadline.at <= turn.at => Some(loop_deadline),
+        (Some(turn), Some(_)) => Some(turn),
+        (Some(turn), None) => Some(turn),
+        (None, Some(loop_deadline)) => Some(loop_deadline),
+        (None, None) => None,
+    }
+}
+
+fn elapsed_timeout(deadline: Option<TimeoutDeadline>) -> Option<TimeoutDeadline> {
+    deadline.filter(|deadline| Instant::now() >= deadline.at)
+}
+
+async fn wait_for_timeout(deadline: Option<TimeoutDeadline>) {
+    if let Some(deadline) = deadline {
+        sleep_until(deadline.at).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 struct Runner<M, P, S>
 where
     M: CompletionModel,
@@ -477,6 +565,8 @@ where
     agent: Arc<Agent<M, P>>,
     app_state: Arc<S>,
     max_turns: usize,
+    turn_timeout: Option<Duration>,
+    loop_timeout: Option<Duration>,
     turn_hook: Option<TurnHook<S>>,
     events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
     state: SharedMessages,
@@ -497,6 +587,8 @@ where
         agent: Arc<Agent<M, P>>,
         app_state: Arc<S>,
         max_turns: usize,
+        turn_timeout: Option<Duration>,
+        loop_timeout: Option<Duration>,
         turn_hook: Option<TurnHook<S>>,
         events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
         state: SharedMessages,
@@ -515,6 +607,8 @@ where
             agent,
             app_state,
             max_turns,
+            turn_timeout,
+            loop_timeout,
             turn_hook,
             events_tx,
             state,
@@ -689,14 +783,29 @@ where
         mut commands_rx: mpsc::UnboundedReceiver<Command>,
     ) -> Result<AgentLoopResult, AgentLoopError> {
         self.emit(AgentLoopEvent::LoopStarted);
+        let loop_deadline = self
+            .loop_timeout
+            .map(|timeout| TimeoutDeadline::new(TimeoutKind::Loop, timeout));
 
         loop {
+            if let Some(deadline) = elapsed_timeout(loop_deadline) {
+                return Ok(self.finish(deadline.end_reason()));
+            }
+
             if self.drain_ready_commands(&mut commands_rx) == CommandAction::Abort {
                 return Ok(self.finish(EndReason::Aborted));
             }
 
             if !self.has_pending_turn() {
-                let Some(command) = commands_rx.recv().await else {
+                let command = tokio::select! {
+                    command = commands_rx.recv() => command,
+                    _ = wait_for_timeout(loop_deadline), if loop_deadline.is_some() => {
+                        let deadline = loop_deadline.expect("loop timeout branch requires a deadline");
+                        return Ok(self.finish(deadline.end_reason()));
+                    }
+                };
+
+                let Some(command) = command else {
                     return Ok(self.finish(EndReason::Idle));
                 };
 
@@ -714,7 +823,7 @@ where
                 continue;
             };
 
-            match self.run_turn(turn, &mut commands_rx).await? {
+            match self.run_turn(turn, &mut commands_rx, loop_deadline).await? {
                 PromptAction::Continue => {}
                 PromptAction::Abort => return Ok(self.finish(EndReason::Aborted)),
                 PromptAction::Finish(end_reason) => return Ok(self.finish(end_reason)),
@@ -726,6 +835,7 @@ where
         &mut self,
         turn: PendingTurn,
         commands_rx: &mut mpsc::UnboundedReceiver<Command>,
+        loop_deadline: Option<TimeoutDeadline>,
     ) -> Result<PromptAction, AgentLoopError> {
         let committed_base_history = self.history_snapshot();
         let turn = PreparedTurn::from_pending(turn, committed_base_history)?;
@@ -737,14 +847,23 @@ where
 
         let mut partial_turn = PartialTurn::default();
         let mut commands_closed = false;
-        let mut stream = self
+        let turn_deadline = self
+            .turn_timeout
+            .map(|timeout| TimeoutDeadline::new(TimeoutKind::Turn, timeout));
+        let stream_future = self
             .agent
             .stream_prompt(turn.prompt.clone())
             .with_history(turn.request_history.clone())
             .multi_turn(self.max_turns)
-            .await;
+            .into_future();
+        tokio::pin!(stream_future);
 
-        loop {
+        let mut stream = loop {
+            let deadline = next_timeout(turn_deadline, loop_deadline);
+            if let Some(deadline) = elapsed_timeout(deadline) {
+                return self.timeout_turn(&turn, &partial_turn, deadline).await;
+            }
+
             tokio::select! {
                 command = commands_rx.recv(), if !commands_closed => {
                     let Some(command) = command else {
@@ -752,27 +871,44 @@ where
                         continue;
                     };
 
-                    match command {
-                        Command::Steer(message) => self.steering.push_back(message),
-                        Command::FollowUp(message) => self.follow_ups.push_back(message),
-                        Command::Resume => self.resumes += 1,
-                        Command::Interrupt(message) => {
-                            let messages = turn.partial_messages(&partial_turn);
-                            if let CommitOutcome::Abort(end_reason) = self
-                                .commit_append(messages, CommitEvent::TurnInterrupted)
-                                .await?
-                            {
-                                return Ok(PromptAction::Finish(end_reason));
-                            }
-                            self.immediate.push_front(message);
-                            return Ok(PromptAction::Continue);
-                        }
-                        Command::Abort => {
-                            let messages = turn.partial_messages(&partial_turn);
-                            self.commit_append(messages, CommitEvent::TurnAborted).await?;
-                            return Ok(PromptAction::Abort);
-                        }
+                    if let Some(action) = self
+                        .handle_turn_command(command, &turn, &partial_turn)
+                        .await?
+                    {
+                        return Ok(action);
                     }
+                }
+                _ = wait_for_timeout(deadline), if deadline.is_some() => {
+                    let deadline = deadline.expect("timeout branch requires a deadline");
+                    return self.timeout_turn(&turn, &partial_turn, deadline).await;
+                }
+                stream = &mut stream_future => break stream,
+            }
+        };
+
+        loop {
+            let deadline = next_timeout(turn_deadline, loop_deadline);
+            if let Some(deadline) = elapsed_timeout(deadline) {
+                return self.timeout_turn(&turn, &partial_turn, deadline).await;
+            }
+
+            tokio::select! {
+                command = commands_rx.recv(), if !commands_closed => {
+                    let Some(command) = command else {
+                        commands_closed = true;
+                        continue;
+                    };
+
+                    if let Some(action) = self
+                        .handle_turn_command(command, &turn, &partial_turn)
+                        .await?
+                    {
+                        return Ok(action);
+                    }
+                }
+                _ = wait_for_timeout(deadline), if deadline.is_some() => {
+                    let deadline = deadline.expect("timeout branch requires a deadline");
+                    return self.timeout_turn(&turn, &partial_turn, deadline).await;
                 }
                 item = stream.next() => {
                     let Some(item) = item else {
@@ -802,6 +938,50 @@ where
                 }
             }
         }
+    }
+
+    async fn handle_turn_command(
+        &mut self,
+        command: Command,
+        turn: &PreparedTurn,
+        partial_turn: &PartialTurn,
+    ) -> Result<Option<PromptAction>, AgentLoopError> {
+        match command {
+            Command::Steer(message) => self.steering.push_back(message),
+            Command::FollowUp(message) => self.follow_ups.push_back(message),
+            Command::Resume => self.resumes += 1,
+            Command::Interrupt(message) => {
+                let messages = turn.partial_messages(partial_turn);
+                if let CommitOutcome::Abort(end_reason) = self
+                    .commit_append(messages, CommitEvent::TurnInterrupted)
+                    .await?
+                {
+                    return Ok(Some(PromptAction::Finish(end_reason)));
+                }
+                self.immediate.push_front(message);
+                return Ok(Some(PromptAction::Continue));
+            }
+            Command::Abort => {
+                let messages = turn.partial_messages(partial_turn);
+                self.commit_append(messages, CommitEvent::TurnAborted)
+                    .await?;
+                return Ok(Some(PromptAction::Abort));
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn timeout_turn(
+        &mut self,
+        turn: &PreparedTurn,
+        partial_turn: &PartialTurn,
+        deadline: TimeoutDeadline,
+    ) -> Result<PromptAction, AgentLoopError> {
+        let messages = turn.partial_messages(partial_turn);
+        self.commit_append(messages, CommitEvent::TurnTimedOut)
+            .await?;
+        Ok(PromptAction::Finish(deadline.end_reason()))
     }
 
     async fn handle_stream_item(
@@ -933,6 +1113,7 @@ enum CommitEvent {
     TurnCommitted,
     TurnInterrupted,
     TurnAborted,
+    TurnTimedOut,
 }
 
 impl CommitEvent {
@@ -941,6 +1122,7 @@ impl CommitEvent {
             Self::TurnCommitted => AgentLoopEvent::TurnCommitted { messages },
             Self::TurnInterrupted => AgentLoopEvent::TurnInterrupted { messages },
             Self::TurnAborted => AgentLoopEvent::TurnAborted { messages },
+            Self::TurnTimedOut => AgentLoopEvent::TurnTimedOut { messages },
         }
     }
 }
@@ -1284,16 +1466,21 @@ mod tests {
     use super::*;
     use rig::{
         agent::AgentBuilder,
-        completion::ToolDefinition,
+        completion::{
+            CompletionError, CompletionModel, CompletionRequest, CompletionResponse, ToolDefinition,
+        },
         message::{ToolResult, UserContent},
-        streaming::{StreamedAssistantContent, ToolCallDeltaContent},
-        test_utils::{MockAddTool, MockCompletionModel, MockStreamEvent},
+        streaming::{
+            RawStreamingChoice, StreamedAssistantContent, StreamingCompletionResponse,
+            ToolCallDeltaContent,
+        },
+        test_utils::{MockAddTool, MockCompletionModel, MockResponse, MockStreamEvent},
         tool::Tool,
     };
     use std::sync::{Arc, Mutex};
     use tokio::{
         sync::Notify,
-        time::{Duration, timeout},
+        time::{Duration, sleep, timeout},
     };
 
     #[tokio::test(flavor = "current_thread")]
@@ -1834,6 +2021,187 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn turn_timeout_covers_stream_setup_and_runs_hook() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let turn_timeout = Duration::from_millis(50);
+        let agent = AgentBuilder::new(BlockingStreamModel {
+            entered: entered.clone(),
+            release: release.clone(),
+        })
+        .build();
+        let seen = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+        let hook_seen = seen.clone();
+        let agent_loop = AgentLoop::new(agent)
+            .turn_timeout(turn_timeout)
+            .with_turn_hook(move |_, turn| {
+                let hook_seen = hook_seen.clone();
+                async move {
+                    hook_seen
+                        .lock()
+                        .unwrap()
+                        .push((turn.history.len(), turn.new_messages.len()));
+                    Ok::<_, std::io::Error>(TurnHookAction::Continue)
+                }
+            });
+
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
+
+        entered.notified().await;
+        let result = timeout(Duration::from_secs(1), handle.wait())
+            .await
+            .expect("turn timeout should finish while stream setup is blocked")
+            .unwrap();
+        release.notify_one();
+
+        assert_eq!(
+            result.end_reason,
+            EndReason::TurnTimedOut {
+                timeout: turn_timeout
+            }
+        );
+        assert!(result.history.is_empty());
+        assert_eq!(&seen.lock().unwrap()[..], &[(0, 0)]);
+        let events = drain_events(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentLoopEvent::TurnTimedOut { messages } if messages.is_empty())
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn turn_timeout_runs_hook_with_safe_partial_append() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let turn_timeout = Duration::from_millis(50);
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::tool_call("call_1", BlockingTool::NAME, serde_json::json!({})),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model)
+            .tool(BlockingTool {
+                entered: entered.clone(),
+                release: release.clone(),
+            })
+            .build();
+        let seen = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+        let hook_seen = seen.clone();
+        let agent_loop = AgentLoop::new(agent)
+            .turn_timeout(turn_timeout)
+            .with_turn_hook(move |_, turn| {
+                let hook_seen = hook_seen.clone();
+                async move {
+                    hook_seen
+                        .lock()
+                        .unwrap()
+                        .push((turn.history.len(), turn.new_messages.len()));
+                    Ok::<_, std::io::Error>(TurnHookAction::Continue)
+                }
+            });
+
+        let handle = agent_loop.prompt(Message::user("start"));
+
+        entered.notified().await;
+        let result = timeout(Duration::from_secs(1), handle.wait())
+            .await
+            .expect("turn timeout should finish without waiting for tool completion")
+            .unwrap();
+        release.notify_one();
+
+        assert_eq!(
+            result.end_reason,
+            EndReason::TurnTimedOut {
+                timeout: turn_timeout
+            }
+        );
+        assert!(result.history.is_empty());
+        assert_eq!(&seen.lock().unwrap()[..], &[(0, 0)]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loop_timeout_wins_over_turn_timeout_during_active_turn() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let loop_timeout = Duration::from_millis(50);
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::tool_call("call_1", BlockingTool::NAME, serde_json::json!({})),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model)
+            .tool(BlockingTool {
+                entered: entered.clone(),
+                release: release.clone(),
+            })
+            .build();
+        let agent_loop = AgentLoop::new(agent)
+            .turn_timeout(Duration::from_secs(5))
+            .loop_timeout(loop_timeout);
+
+        let handle = agent_loop.prompt(Message::user("start"));
+
+        entered.notified().await;
+        let result = timeout(Duration::from_secs(1), handle.wait())
+            .await
+            .expect("loop timeout should finish while turn is blocked")
+            .unwrap();
+        release.notify_one();
+
+        assert_eq!(
+            result.end_reason,
+            EndReason::LoopTimedOut {
+                timeout: loop_timeout
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loop_timeout_while_idle_does_not_run_turn_hook_again() {
+        let loop_timeout = Duration::from_millis(50);
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("done"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+        let seen = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+        let hook_seen = seen.clone();
+        let agent_loop = AgentLoop::new(agent)
+            .loop_timeout(loop_timeout)
+            .with_turn_hook(move |_, turn| {
+                let hook_seen = hook_seen.clone();
+                async move {
+                    hook_seen
+                        .lock()
+                        .unwrap()
+                        .push((turn.history.len(), turn.new_messages.len()));
+                    Ok::<_, std::io::Error>(TurnHookAction::Continue)
+                }
+            });
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
+
+        loop {
+            match events.recv().await.unwrap() {
+                AgentLoopEvent::TurnCommitted { .. } => break,
+                AgentLoopEvent::LoopEnded { end_reason } => {
+                    panic!("loop ended before commit: {end_reason:?}")
+                }
+                _ => {}
+            }
+        }
+
+        sleep(loop_timeout + Duration::from_millis(50)).await;
+        let result = handle.wait().await.unwrap();
+
+        assert_eq!(
+            result.end_reason,
+            EndReason::LoopTimedOut {
+                timeout: loop_timeout
+            }
+        );
+        assert_eq!(&seen.lock().unwrap()[..], &[(2, 2)]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn provider_content_filter_error_returns_end_reason() {
         let model = MockCompletionModel::from_stream_turns([[MockStreamEvent::error(
             "content_filter: request blocked by policy",
@@ -2217,6 +2585,47 @@ mod tests {
             self.entered.notify_one();
             self.release.notified().await;
             Ok("released".to_string())
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingStreamModel {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl CompletionModel for BlockingStreamModel {
+        type Response = MockResponse;
+        type StreamingResponse = MockResponse;
+        type Client = ();
+
+        fn make(_: &Self::Client, _: impl Into<String>) -> Self {
+            Self {
+                entered: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+            }
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            Err(CompletionError::ProviderError(
+                "blocking stream model does not support non-streaming completion".to_string(),
+            ))
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            let stream: rig::streaming::StreamingResult<Self::StreamingResponse> =
+                Box::pin(futures::stream::empty::<
+                    Result<RawStreamingChoice<MockResponse>, CompletionError>,
+                >());
+            Ok(StreamingCompletionResponse::stream(stream))
         }
     }
 

@@ -12,7 +12,7 @@ categories = ["asynchronous"]
 [dependencies]
 futures = "0.3.32"
 rig = "0.38.2"
-tokio = { version = "1.52.3", features = ["macros", "rt", "sync"] }
+tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 anyhow = "1.0.102"

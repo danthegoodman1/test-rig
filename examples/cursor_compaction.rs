@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fmt,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use rig::{
@@ -118,6 +119,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let agent_loop = AgentLoop::new(agent)
+        .turn_timeout(Duration::from_secs(30))
+        .loop_timeout(Duration::from_secs(120))
         .with_app_state(app_state)
         .with_turn_hook(|state, turn| async move {
             if !turn.new_messages.is_empty() {
