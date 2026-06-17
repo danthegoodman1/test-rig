@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fmt,
     future::Future,
@@ -12,7 +12,7 @@ use rig::{
     OneOrMany,
     agent::{Agent, MultiTurnStreamItem, PromptHook, StreamingError},
     completion::{CompletionError, CompletionModel, GetTokenUsage, PromptError},
-    message::{AssistantContent, Message, ToolCall, ToolResult, UserContent},
+    message::{AssistantContent, Message, ToolCall, UserContent},
     streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt},
     wasm_compat::WasmCompatSend,
 };
@@ -379,6 +379,7 @@ pub enum AgentLoopEvent<R> {
 #[derive(Debug)]
 pub enum AgentLoopError {
     CommandChannelClosed,
+    InvalidHistory(InvalidHistoryError),
     Persist(PersistError),
     ContextTransform(ContextTransformError),
     Rig(StreamingError),
@@ -389,6 +390,7 @@ impl fmt::Display for AgentLoopError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CommandChannelClosed => f.write_str("agent loop command channel is closed"),
+            Self::InvalidHistory(err) => write!(f, "{err}"),
             Self::Persist(err) => write!(f, "persistence hook failed: {err}"),
             Self::ContextTransform(err) => write!(f, "context transform failed: {err}"),
             Self::Rig(err) => write!(f, "{err}"),
@@ -400,6 +402,7 @@ impl fmt::Display for AgentLoopError {
 impl Error for AgentLoopError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InvalidHistory(err) => Some(err),
             Self::Persist(err) => Some(err.as_ref()),
             Self::ContextTransform(err) => Some(err.as_ref()),
             Self::Rig(err) => Some(err),
@@ -414,6 +417,27 @@ impl From<StreamingError> for AgentLoopError {
         Self::Rig(err)
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidHistoryError {
+    pub message: String,
+}
+
+impl InvalidHistoryError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for InvalidHistoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid agent history: {}", self.message)
+    }
+}
+
+impl Error for InvalidHistoryError {}
 
 enum Command {
     Steer(Message),
@@ -606,6 +630,7 @@ where
             .map_err(AgentLoopError::ContextTransform)?;
 
         if after != before {
+            validate_message_history(&after).map_err(AgentLoopError::InvalidHistory)?;
             *lock_messages(&self.state) = after.clone();
             self.emit(AgentLoopEvent::ContextTransformed { messages: after });
         }
@@ -618,13 +643,15 @@ where
         turn: PendingTurn,
         commands_rx: &mut mpsc::UnboundedReceiver<Command>,
     ) -> Result<PromptAction, AgentLoopError> {
+        let committed_base_history = self.history_snapshot();
+        let mut request_history = committed_base_history.clone();
+        request_history.extend(turn.prelude.clone());
+        validate_message_history(&request_history).map_err(AgentLoopError::InvalidHistory)?;
+
         self.emit(AgentLoopEvent::TurnStarted {
             prompt: turn.prompt.clone(),
         });
 
-        let committed_base_history = self.history_snapshot();
-        let mut request_history = committed_base_history.clone();
-        request_history.extend(turn.prelude.clone());
         let mut partial_turn = PartialTurn::default();
         let mut commands_closed = false;
         let mut stream = self
@@ -787,8 +814,8 @@ impl CommitEvent {
 #[derive(Default)]
 struct PartialTurn {
     pending_tool_calls: HashMap<String, ToolCall>,
-    completed_tool_calls: Vec<ToolCall>,
-    completed_tool_results: Vec<ToolResult>,
+    assistant_content: Vec<AssistantContent>,
+    completed_messages: Vec<Message>,
 }
 
 impl PartialTurn {
@@ -796,12 +823,23 @@ impl PartialTurn {
     where
         R: Clone,
     {
-        if let StreamedAssistantContent::ToolCall {
-            internal_call_id,
-            tool_call,
-        } = item
-        {
-            self.pending_tool_calls.insert(internal_call_id, tool_call);
+        match item {
+            StreamedAssistantContent::Text(text) => {
+                self.assistant_content.push(AssistantContent::Text(text));
+            }
+            StreamedAssistantContent::Reasoning(reasoning) => {
+                self.assistant_content
+                    .push(AssistantContent::Reasoning(reasoning));
+            }
+            StreamedAssistantContent::ToolCall {
+                internal_call_id,
+                tool_call,
+            } => {
+                self.pending_tool_calls.insert(internal_call_id, tool_call);
+            }
+            StreamedAssistantContent::ToolCallDelta { .. }
+            | StreamedAssistantContent::ReasoningDelta { .. }
+            | StreamedAssistantContent::Final(_) => {}
         }
     }
 
@@ -815,43 +853,139 @@ impl PartialTurn {
             return;
         };
 
-        self.completed_tool_calls.push(tool_call);
-        self.completed_tool_results.push(tool_result);
+        self.assistant_content
+            .push(AssistantContent::ToolCall(tool_call));
+
+        let Ok(assistant_content) = OneOrMany::many(std::mem::take(&mut self.assistant_content))
+        else {
+            return;
+        };
+
+        self.completed_messages.push(Message::Assistant {
+            id: None,
+            content: assistant_content,
+        });
+        self.completed_messages.push(Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(tool_result)),
+        });
     }
 
     fn append_messages(&self, prompt: &Message) -> Option<Vec<Message>> {
-        if self.completed_tool_calls.is_empty() {
+        if self.completed_messages.is_empty() {
             return None;
         }
 
-        let assistant_content = OneOrMany::many(
-            self.completed_tool_calls
-                .iter()
-                .cloned()
-                .map(AssistantContent::ToolCall)
-                .collect::<Vec<_>>(),
-        )
-        .ok()?;
-        let user_content = OneOrMany::many(
-            self.completed_tool_results
-                .iter()
-                .cloned()
-                .map(UserContent::ToolResult)
-                .collect::<Vec<_>>(),
-        )
-        .ok()?;
-
-        Some(vec![
-            prompt.clone(),
-            Message::Assistant {
-                id: None,
-                content: assistant_content,
-            },
-            Message::User {
-                content: user_content,
-            },
-        ])
+        let mut messages = Vec::with_capacity(self.completed_messages.len() + 1);
+        messages.push(prompt.clone());
+        messages.extend(self.completed_messages.clone());
+        Some(messages)
     }
+}
+
+fn validate_message_history(messages: &[Message]) -> Result<(), InvalidHistoryError> {
+    let mut pending_tool_calls: Option<(usize, Vec<String>)> = None;
+
+    for (index, message) in messages.iter().enumerate() {
+        if let Some((assistant_index, expected_ids)) = pending_tool_calls.take() {
+            let Message::User { content } = message else {
+                return Err(InvalidHistoryError::new(format!(
+                    "assistant message {assistant_index} contains tool calls, but message {index} is not the required user tool-result message"
+                )));
+            };
+
+            let result_ids = tool_result_ids(content);
+            if result_ids.is_empty() {
+                return Err(InvalidHistoryError::new(format!(
+                    "assistant message {assistant_index} contains tool calls, but user message {index} contains no tool results"
+                )));
+            }
+
+            ensure_unique_ids(&result_ids, index, "tool result")?;
+
+            for id in &expected_ids {
+                if !result_ids.contains(id) {
+                    return Err(InvalidHistoryError::new(format!(
+                        "assistant tool call `{id}` at message {assistant_index} is missing a matching tool result in message {index}"
+                    )));
+                }
+            }
+
+            for id in &result_ids {
+                if !expected_ids.contains(id) {
+                    return Err(InvalidHistoryError::new(format!(
+                        "tool result `{id}` at message {index} does not match any tool call from message {assistant_index}"
+                    )));
+                }
+            }
+
+            continue;
+        }
+
+        match message {
+            Message::Assistant { content, .. } => {
+                let tool_call_ids = assistant_tool_call_ids(content);
+                ensure_unique_ids(&tool_call_ids, index, "tool call")?;
+                if !tool_call_ids.is_empty() {
+                    pending_tool_calls = Some((index, tool_call_ids));
+                }
+            }
+            Message::User { content } => {
+                let result_ids = tool_result_ids(content);
+                if let Some(id) = result_ids.first() {
+                    return Err(InvalidHistoryError::new(format!(
+                        "tool result `{id}` at message {index} has no immediately preceding assistant tool call"
+                    )));
+                }
+            }
+            Message::System { .. } => {}
+        }
+    }
+
+    if let Some((assistant_index, expected_ids)) = pending_tool_calls {
+        return Err(InvalidHistoryError::new(format!(
+            "assistant message {assistant_index} contains unanswered tool calls: {}",
+            expected_ids.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
+fn assistant_tool_call_ids(content: &OneOrMany<AssistantContent>) -> Vec<String> {
+    content
+        .iter()
+        .filter_map(|item| match item {
+            AssistantContent::ToolCall(tool_call) => Some(tool_call.id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_result_ids(content: &OneOrMany<UserContent>) -> Vec<String> {
+    content
+        .iter()
+        .filter_map(|item| match item {
+            UserContent::ToolResult(tool_result) => Some(tool_result.id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ensure_unique_ids(
+    ids: &[String],
+    message_index: usize,
+    kind: &str,
+) -> Result<(), InvalidHistoryError> {
+    let mut seen = HashSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            return Err(InvalidHistoryError::new(format!(
+                "duplicate {kind} id `{id}` at message {message_index}"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -996,7 +1130,7 @@ mod tests {
     use super::*;
     use rig::{
         agent::AgentBuilder,
-        message::UserContent,
+        message::{ToolResult, UserContent},
         streaming::{StreamedAssistantContent, ToolCallDeltaContent},
         test_utils::{MockAddTool, MockCompletionModel, MockStreamEvent},
     };
@@ -1049,6 +1183,26 @@ mod tests {
             vec!["previous", "start"]
         );
         assert_eq!(user_texts(result.history.iter()), vec!["previous", "start"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_history_with_unanswered_tool_call_fails_before_request() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("unused"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model.clone()).build();
+        let agent_loop =
+            AgentLoop::new(agent).with_history([assistant_tool_call_message("call_1")]);
+
+        let err = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .expect_err("invalid history should fail before a request is sent");
+
+        assert!(matches!(err, AgentLoopError::InvalidHistory(_)));
+        assert_eq!(model.request_count(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1119,6 +1273,27 @@ mod tests {
             .expect_err("context transform failure should fail the run");
 
         assert!(matches!(err, AgentLoopError::ContextTransform(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn context_transform_invalid_history_fails_before_request() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("unused"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model.clone()).build();
+        let agent_loop = AgentLoop::new(agent).with_context_transform(|_, _messages| async {
+            Ok::<_, std::io::Error>(vec![assistant_tool_call_message("call_1")])
+        });
+
+        let err = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .expect_err("invalid transformed history should fail before a request is sent");
+
+        assert!(matches!(err, AgentLoopError::InvalidHistory(_)));
+        assert_eq!(model.request_count(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1500,15 +1675,8 @@ mod tests {
     #[test]
     fn partial_turn_commits_completed_tool_results() {
         let mut partial = PartialTurn::default();
-        let tool_call = ToolCall::new(
-            "call_1".to_string(),
-            rig::message::ToolFunction::new("echo".to_string(), serde_json::json!({"text": "hi"})),
-        );
-        let tool_result = ToolResult {
-            id: "call_1".to_string(),
-            call_id: None,
-            content: rig::message::ToolResultContent::from_tool_output("echoed".to_string()),
-        };
+        let tool_call = test_tool_call("call_1");
+        let tool_result = test_tool_result("call_1");
 
         partial.note_assistant_item(
             StreamedAssistantContent::<rig::test_utils::MockResponse>::ToolCall {
@@ -1530,6 +1698,56 @@ mod tests {
         assert!(
             matches!(&messages[2], Message::User { content } if matches!(content.first(), UserContent::ToolResult(_)))
         );
+    }
+
+    #[test]
+    fn partial_turn_preserves_text_before_completed_tool_result() {
+        let mut partial = PartialTurn::default();
+
+        partial.note_assistant_item(
+            StreamedAssistantContent::<rig::test_utils::MockResponse>::Text(
+                rig::message::Text::new("I will call the tool."),
+            ),
+        );
+        partial.note_assistant_item(
+            StreamedAssistantContent::<rig::test_utils::MockResponse>::ToolCall {
+                internal_call_id: "internal_1".to_string(),
+                tool_call: test_tool_call("call_1"),
+            },
+        );
+        partial.note_user_item(StreamedUserContent::ToolResult {
+            internal_call_id: "internal_1".to_string(),
+            tool_result: test_tool_result("call_1"),
+        });
+
+        let messages = partial
+            .append_messages(&Message::user("start"))
+            .expect("completed tool results should produce history");
+        let Message::Assistant { content, .. } = &messages[1] else {
+            panic!("expected assistant message");
+        };
+        let items = content.iter().collect::<Vec<_>>();
+
+        assert!(
+            matches!(items[0], AssistantContent::Text(text) if text.text == "I will call the tool.")
+        );
+        assert!(
+            matches!(items[1], AssistantContent::ToolCall(tool_call) if tool_call.id == "call_1")
+        );
+    }
+
+    #[test]
+    fn partial_turn_ignores_unanswered_tool_call() {
+        let mut partial = PartialTurn::default();
+
+        partial.note_assistant_item(
+            StreamedAssistantContent::<rig::test_utils::MockResponse>::ToolCall {
+                internal_call_id: "internal_1".to_string(),
+                tool_call: test_tool_call("call_1"),
+            },
+        );
+
+        assert!(partial.append_messages(&Message::user("start")).is_none());
     }
 
     fn user_prompts(model: &MockCompletionModel) -> Vec<String> {
@@ -1560,6 +1778,28 @@ mod tests {
             UserContent::Text(text) => Some(text.text.clone()),
             _ => None,
         })
+    }
+
+    fn assistant_tool_call_message(id: &str) -> Message {
+        Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(test_tool_call(id))),
+        }
+    }
+
+    fn test_tool_call(id: &str) -> ToolCall {
+        ToolCall::new(
+            id.to_string(),
+            rig::message::ToolFunction::new("echo".to_string(), serde_json::json!({"text": "hi"})),
+        )
+    }
+
+    fn test_tool_result(id: &str) -> ToolResult {
+        ToolResult {
+            id: id.to_string(),
+            call_id: None,
+            content: rig::message::ToolResultContent::from_tool_output("echoed".to_string()),
+        }
     }
 
     fn drain_events<R: Clone>(
