@@ -1,49 +1,14 @@
-use std::{
-    collections::VecDeque,
-    error::Error,
-    fmt,
-    sync::{Arc, Mutex, MutexGuard},
-};
+use std::{error::Error, fmt};
 
-use futures::StreamExt;
+use agentloop::AgentLoop;
 use rig::{
-    agent::{Agent, AgentBuilder, MultiTurnStreamItem},
+    agent::AgentBuilder,
     completion::ToolDefinition,
     message::Message,
-    streaming::StreamingPrompt,
     test_utils::{MockCompletionModel, MockStreamEvent},
     tool::Tool,
 };
 use serde_json::{Value, json};
-
-mod printing;
-
-use printing::{
-    first_text, print_history, print_user_prompt, record_usage, render_assistant_item,
-    render_user_item,
-};
-
-#[derive(Clone, Default)]
-struct SteerQueue {
-    queued: Arc<Mutex<VecDeque<Message>>>,
-}
-
-impl SteerQueue {
-    fn steer(&self, message: impl Into<Message>) {
-        lock(&self.queued).push_back(message.into());
-    }
-
-    fn pop(&self) -> Option<Message> {
-        lock(&self.queued).pop_front()
-    }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
 
 struct EchoTool;
 
@@ -94,14 +59,25 @@ impl Tool for EchoTool {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let agent = AgentBuilder::new(scripted_model()).tool(EchoTool).build();
-    let steer_queue = SteerQueue::default();
+    let agent_loop = AgentLoop::new(agent);
+    let handle = agent_loop.prompt(Message::user(
+        "Start by calling the echo tool with a draft input.",
+    ));
 
-    run_streaming_with_steer(
-        &agent,
-        steer_queue,
-        Message::user("Start by calling the echo tool with a draft input."),
-    )
-    .await
+    handle.steer(Message::user(
+        "Steer: stop building that tool input and answer directly.",
+    ))?;
+    handle.follow_up(Message::user("Also summarize what happened."))?;
+
+    let result = handle.wait().await?;
+    println!("end_reason: {:?}", result.end_reason);
+    println!(
+        "last_response: {}",
+        result.last_response.unwrap_or_default()
+    );
+    println!("history messages: {}", result.history.len());
+
+    Ok(())
 }
 
 fn scripted_model() -> MockCompletionModel {
@@ -118,77 +94,12 @@ fn scripted_model() -> MockCompletionModel {
             MockStreamEvent::final_response_with_default_usage(),
         ],
         vec![
-            MockStreamEvent::text("Queued steer handled on the next outer-loop prompt."),
+            MockStreamEvent::text("Queued steer handled by the harness."),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+        vec![
+            MockStreamEvent::text("Follow-up handled after steering."),
             MockStreamEvent::final_response_with_default_usage(),
         ],
     ])
-}
-
-async fn run_streaming_with_steer(
-    agent: &Agent<MockCompletionModel>,
-    steer_queue: SteerQueue,
-    first_prompt: Message,
-) -> anyhow::Result<()> {
-    let mut history = Vec::<Message>::new();
-    let mut next_prompt = first_prompt;
-    let mut simulated_user_steer_sent = false;
-
-    loop {
-        println!("\n=== starting stream ===");
-        print_user_prompt(&next_prompt);
-
-        let mut completed = false;
-
-        let mut stream = agent
-            .stream_prompt(next_prompt.clone())
-            .with_history(history.clone())
-            .multi_turn(100)
-            .await;
-
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(item)) => {
-                    if render_assistant_item(&item) && !simulated_user_steer_sent {
-                        let steer = Message::user(
-                            "Steer: stop building that tool input and answer directly.",
-                        );
-                        println!(
-                            "ui> queued steer: {}",
-                            first_text(&steer).unwrap_or_default()
-                        );
-                        steer_queue.steer(steer);
-                        simulated_user_steer_sent = true;
-                    }
-                }
-                Ok(MultiTurnStreamItem::StreamUserItem(item)) => {
-                    render_user_item(&item);
-                }
-                Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                    record_usage(call);
-                }
-                Ok(MultiTurnStreamItem::FinalResponse(final_response)) => {
-                    println!("final> {}", final_response.response());
-                    if let Some(messages) = final_response.history() {
-                        history.extend(messages.iter().cloned());
-                    }
-                    completed = true;
-                }
-                Ok(_) => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
-
-        if completed {
-            print_history("history after completed stream", &history);
-        }
-
-        if let Some(steer_message) = steer_queue.pop() {
-            next_prompt = steer_message;
-            continue;
-        }
-
-        break;
-    }
-
-    Ok(())
 }
