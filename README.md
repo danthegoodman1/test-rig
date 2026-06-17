@@ -163,9 +163,9 @@ while let Ok(event) = events.recv().await {
 ```
 
 `LoopEnded` is emitted for normal loop outcomes, including provider/tool
-outcomes represented as `EndReason`s. `LoopFailed` is emitted when the runner
-itself returns an `AgentLoopError`, such as a failed turn hook or invalid
-history.
+outcomes represented as `EndReason`s such as `ContextFull` or `ApiError`.
+`LoopFailed` is emitted when the runner itself returns an `AgentLoopError`,
+such as a failed turn hook or invalid Rig message history shape/order.
 
 ## History and Resume
 

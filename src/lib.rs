@@ -171,7 +171,8 @@ where
 
     /// Start the loop from the seeded history without appending a new prompt.
     pub fn resume(&self) -> Result<AgentLoopHandle<M::StreamingResponse>, AgentLoopError> {
-        validate_resume_history(&self.initial_history).map_err(AgentLoopError::InvalidHistory)?;
+        validate_resume_history(&self.initial_history)
+            .map_err(AgentLoopError::InvalidMessageHistory)?;
         Ok(self.start(PendingTurn::Resume))
     }
 
@@ -280,7 +281,7 @@ where
             return Ok(());
         }
 
-        validate_resume_history(&self.state()).map_err(AgentLoopError::InvalidHistory)?;
+        validate_resume_history(&self.state()).map_err(AgentLoopError::InvalidMessageHistory)?;
         self.send(Command::Resume)?;
         self.emit(AgentLoopEvent::Queued {
             kind: QueueKind::Resume,
@@ -485,7 +486,7 @@ pub struct AgentLoopErrorInfo {
 #[non_exhaustive]
 pub enum AgentLoopError {
     CommandChannelClosed,
-    InvalidHistory(InvalidHistoryError),
+    InvalidMessageHistory(InvalidMessageHistoryError),
     TurnHook(TurnHookError),
     Rig(StreamingError),
     TaskJoin(tokio::task::JoinError),
@@ -495,7 +496,7 @@ impl fmt::Display for AgentLoopError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CommandChannelClosed => f.write_str("agent loop command channel is closed"),
-            Self::InvalidHistory(err) => write!(f, "{err}"),
+            Self::InvalidMessageHistory(err) => write!(f, "{err}"),
             Self::TurnHook(err) => write!(f, "turn hook failed: {err}"),
             Self::Rig(err) => write!(f, "{err}"),
             Self::TaskJoin(err) => write!(f, "{err}"),
@@ -506,7 +507,7 @@ impl fmt::Display for AgentLoopError {
 impl Error for AgentLoopError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidHistory(err) => Some(err),
+            Self::InvalidMessageHistory(err) => Some(err),
             Self::TurnHook(err) => Some(err.as_ref()),
             Self::Rig(err) => Some(err),
             Self::TaskJoin(err) => Some(err),
@@ -530,11 +531,11 @@ impl AgentLoopErrorInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InvalidHistoryError {
+pub struct InvalidMessageHistoryError {
     pub message: String,
 }
 
-impl InvalidHistoryError {
+impl InvalidMessageHistoryError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -542,13 +543,13 @@ impl InvalidHistoryError {
     }
 }
 
-impl fmt::Display for InvalidHistoryError {
+impl fmt::Display for InvalidMessageHistoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid agent history: {}", self.message)
+        write!(f, "invalid Rig message history: {}", self.message)
     }
 }
 
-impl Error for InvalidHistoryError {}
+impl Error for InvalidMessageHistoryError {}
 
 enum Command {
     Steer(Message),
@@ -788,7 +789,7 @@ impl PreparedTurn {
                 let mut full_request_history = request_history.clone();
                 full_request_history.push(prompt.clone());
                 validate_message_history(&full_request_history)
-                    .map_err(AgentLoopError::InvalidHistory)?;
+                    .map_err(AgentLoopError::InvalidMessageHistory)?;
 
                 Ok(Self {
                     committed_base_history,
@@ -800,7 +801,7 @@ impl PreparedTurn {
             }
             PendingTurn::Resume => {
                 validate_resume_history(&committed_base_history)
-                    .map_err(AgentLoopError::InvalidHistory)?;
+                    .map_err(AgentLoopError::InvalidMessageHistory)?;
                 let Some((prompt, history)) = committed_base_history.split_last() else {
                     unreachable!("validated resume history is non-empty");
                 };
@@ -1108,7 +1109,7 @@ where
         let before = self.history_snapshot();
         let mut next_history = before;
         next_history.extend(messages.clone());
-        validate_message_history(&next_history).map_err(AgentLoopError::InvalidHistory)?;
+        validate_message_history(&next_history).map_err(AgentLoopError::InvalidMessageHistory)?;
 
         let mut replaced_history = None;
         let mut abort_reason = None;
@@ -1125,7 +1126,8 @@ where
             {
                 TurnHookAction::Continue => {}
                 TurnHookAction::ReplaceHistory(history) => {
-                    validate_message_history(&history).map_err(AgentLoopError::InvalidHistory)?;
+                    validate_message_history(&history)
+                        .map_err(AgentLoopError::InvalidMessageHistory)?;
                     next_history = history.clone();
                     replaced_history = Some(history);
                 }
@@ -1155,12 +1157,15 @@ where
         base_history: &[Message],
         recovered_history: Vec<Message>,
     ) -> Result<CommitOutcome, AgentLoopError> {
-        validate_message_history(&recovered_history).map_err(AgentLoopError::InvalidHistory)?;
+        validate_message_history(&recovered_history)
+            .map_err(AgentLoopError::InvalidMessageHistory)?;
 
         if !recovered_history.starts_with(base_history) {
-            return Err(AgentLoopError::InvalidHistory(InvalidHistoryError::new(
-                "recovered history does not extend the committed base history",
-            )));
+            return Err(AgentLoopError::InvalidMessageHistory(
+                InvalidMessageHistoryError::new(
+                    "recovered history does not extend the committed base history",
+                ),
+            ));
         }
 
         let append = recovered_history[base_history.len()..].to_vec();
@@ -1282,20 +1287,20 @@ impl PartialTurn {
     }
 }
 
-fn validate_message_history(messages: &[Message]) -> Result<(), InvalidHistoryError> {
+fn validate_message_history(messages: &[Message]) -> Result<(), InvalidMessageHistoryError> {
     let mut pending_tool_calls: Option<(usize, Vec<String>)> = None;
 
     for (index, message) in messages.iter().enumerate() {
         if let Some((assistant_index, expected_ids)) = pending_tool_calls.take() {
             let Message::User { content } = message else {
-                return Err(InvalidHistoryError::new(format!(
+                return Err(InvalidMessageHistoryError::new(format!(
                     "assistant message {assistant_index} contains tool calls, but message {index} is not the required user tool-result message"
                 )));
             };
 
             let result_ids = tool_result_ids(content);
             if result_ids.is_empty() {
-                return Err(InvalidHistoryError::new(format!(
+                return Err(InvalidMessageHistoryError::new(format!(
                     "assistant message {assistant_index} contains tool calls, but user message {index} contains no tool results"
                 )));
             }
@@ -1304,7 +1309,7 @@ fn validate_message_history(messages: &[Message]) -> Result<(), InvalidHistoryEr
 
             for id in &expected_ids {
                 if !result_ids.contains(id) {
-                    return Err(InvalidHistoryError::new(format!(
+                    return Err(InvalidMessageHistoryError::new(format!(
                         "assistant tool call `{id}` at message {assistant_index} is missing a matching tool result in message {index}"
                     )));
                 }
@@ -1312,7 +1317,7 @@ fn validate_message_history(messages: &[Message]) -> Result<(), InvalidHistoryEr
 
             for id in &result_ids {
                 if !expected_ids.contains(id) {
-                    return Err(InvalidHistoryError::new(format!(
+                    return Err(InvalidMessageHistoryError::new(format!(
                         "tool result `{id}` at message {index} does not match any tool call from message {assistant_index}"
                     )));
                 }
@@ -1332,7 +1337,7 @@ fn validate_message_history(messages: &[Message]) -> Result<(), InvalidHistoryEr
             Message::User { content } => {
                 let result_ids = tool_result_ids(content);
                 if let Some(id) = result_ids.first() {
-                    return Err(InvalidHistoryError::new(format!(
+                    return Err(InvalidMessageHistoryError::new(format!(
                         "tool result `{id}` at message {index} has no immediately preceding assistant tool call"
                     )));
                 }
@@ -1342,7 +1347,7 @@ fn validate_message_history(messages: &[Message]) -> Result<(), InvalidHistoryEr
     }
 
     if let Some((assistant_index, expected_ids)) = pending_tool_calls {
-        return Err(InvalidHistoryError::new(format!(
+        return Err(InvalidMessageHistoryError::new(format!(
             "assistant message {assistant_index} contains unanswered tool calls: {}",
             expected_ids.join(", ")
         )));
@@ -1351,15 +1356,15 @@ fn validate_message_history(messages: &[Message]) -> Result<(), InvalidHistoryEr
     Ok(())
 }
 
-fn validate_resume_history(messages: &[Message]) -> Result<(), InvalidHistoryError> {
+fn validate_resume_history(messages: &[Message]) -> Result<(), InvalidMessageHistoryError> {
     validate_message_history(messages)?;
 
     match messages.last() {
         Some(Message::User { .. } | Message::Assistant { .. }) => Ok(()),
-        Some(Message::System { .. }) => Err(InvalidHistoryError::new(
+        Some(Message::System { .. }) => Err(InvalidMessageHistoryError::new(
             "resume requires the last committed message to be user or assistant content",
         )),
-        None => Err(InvalidHistoryError::new(
+        None => Err(InvalidMessageHistoryError::new(
             "resume requires at least one committed message",
         )),
     }
@@ -1389,11 +1394,11 @@ fn ensure_unique_ids(
     ids: &[String],
     message_index: usize,
     kind: &str,
-) -> Result<(), InvalidHistoryError> {
+) -> Result<(), InvalidMessageHistoryError> {
     let mut seen = HashSet::new();
     for id in ids {
         if !seen.insert(id) {
-            return Err(InvalidHistoryError::new(format!(
+            return Err(InvalidMessageHistoryError::new(format!(
                 "duplicate {kind} id `{id}` at message {message_index}"
             )));
         }
@@ -1654,15 +1659,15 @@ mod tests {
         let agent_loop = AgentLoop::new(agent).with_history([Message::system("summary")]);
 
         let err = match agent_loop.resume() {
-            Ok(_) => panic!("invalid history should not start a resumed loop"),
+            Ok(_) => panic!("invalid message history should not start a resumed loop"),
             Err(err) => err,
         };
 
-        assert!(matches!(err, AgentLoopError::InvalidHistory(_)));
+        assert!(matches!(err, AgentLoopError::InvalidMessageHistory(_)));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn invalid_history_with_unanswered_tool_call_fails_before_request() {
+    async fn invalid_message_history_with_unanswered_tool_call_fails_before_request() {
         let model = MockCompletionModel::from_stream_turns([[
             MockStreamEvent::text("unused"),
             MockStreamEvent::final_response_with_default_usage(),
@@ -1675,9 +1680,9 @@ mod tests {
             .prompt(Message::user("start"))
             .wait()
             .await
-            .expect_err("invalid history should fail before a request is sent");
+            .expect_err("invalid message history should fail before a request is sent");
 
-        assert!(matches!(err, AgentLoopError::InvalidHistory(_)));
+        assert!(matches!(err, AgentLoopError::InvalidMessageHistory(_)));
         assert_eq!(model.request_count(), 0);
     }
 
@@ -1798,7 +1803,7 @@ mod tests {
             .await
             .expect_err("invalid replacement history should fail the commit");
 
-        assert!(matches!(err, AgentLoopError::InvalidHistory(_)));
+        assert!(matches!(err, AgentLoopError::InvalidMessageHistory(_)));
         assert_eq!(model.request_count(), 1);
     }
 
@@ -2330,7 +2335,7 @@ mod tests {
                 .commit_recovered_history(&base, recovered_history)
                 .await
                 .expect_err("non-appendable recovered history should fail");
-            assert!(matches!(err, AgentLoopError::InvalidHistory(_)));
+            assert!(matches!(err, AgentLoopError::InvalidMessageHistory(_)));
             assert_eq!(*lock_messages(&state), base);
         }
 
