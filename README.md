@@ -83,6 +83,11 @@ The queue rules are intentionally simple:
 | `state` | Returns a clone of the committed in-memory Rig message history. |
 | `wait` | Waits for the loop to finish and returns `AgentLoopResult`. |
 
+Dropping `AgentLoopHandle`, or cancelling a pending `wait()`, aborts the
+running task. Use `abort()` followed by `wait()` when you want the loop to stop
+through the normal commit path and keep completed tool results from the active
+turn.
+
 ## Timeouts
 
 Set turn and loop wall-clock timeouts independently:
@@ -151,10 +156,16 @@ while let Ok(event) = events.recv().await {
             // A valid append batch was committed.
         }
         rigloop::AgentLoopEvent::LoopEnded { end_reason } => break,
+        rigloop::AgentLoopEvent::LoopFailed { error } => break,
         _ => {}
     }
 }
 ```
+
+`LoopEnded` is emitted for normal loop outcomes, including provider/tool
+outcomes represented as `EndReason`s. `LoopFailed` is emitted when the runner
+itself returns an `AgentLoopError`, such as a failed turn hook or invalid
+history.
 
 ## History and Resume
 

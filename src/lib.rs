@@ -25,7 +25,7 @@ use tokio::{
         broadcast,
         mpsc::{self, error::TryRecvError},
     },
-    task::JoinHandle,
+    task::{AbortHandle, JoinHandle},
     time::{Instant, sleep_until},
 };
 
@@ -180,26 +180,26 @@ where
         let (events_tx, _) = broadcast::channel(EVENT_BUFFER_SIZE);
         let state = Arc::new(Mutex::new(self.initial_history.clone()));
         let turn_running = Arc::new(AtomicBool::new(false));
-        let runner = Runner::new(
-            self.agent.clone(),
-            self.app_state.clone(),
-            self.max_turns,
-            self.turn_timeout,
-            self.loop_timeout,
-            self.turn_hook.clone(),
-            events_tx.clone(),
-            state.clone(),
-            turn_running.clone(),
+        let runner = Runner::new(RunnerInit {
+            agent: self.agent.clone(),
+            app_state: self.app_state.clone(),
+            max_turns: self.max_turns,
+            turn_timeout: self.turn_timeout,
+            loop_timeout: self.loop_timeout,
+            turn_hook: self.turn_hook.clone(),
+            events_tx: events_tx.clone(),
+            state: state.clone(),
+            turn_running: turn_running.clone(),
             initial_turn,
-        );
+        });
         let task = tokio::spawn(async move { runner.run(commands_rx).await });
 
         AgentLoopHandle {
-            commands_tx,
+            commands_tx: Some(commands_tx),
             events_tx,
             state,
             turn_running,
-            task,
+            task: Some(task),
         }
     }
 }
@@ -209,11 +209,11 @@ pub struct AgentLoopHandle<R>
 where
     R: Clone,
 {
-    commands_tx: mpsc::UnboundedSender<Command>,
+    commands_tx: Option<mpsc::UnboundedSender<Command>>,
     events_tx: broadcast::Sender<AgentLoopEvent<R>>,
     state: SharedMessages,
     turn_running: SharedTurnRunning,
-    task: JoinHandle<Result<AgentLoopResult, AgentLoopError>>,
+    task: Option<JoinHandle<Result<AgentLoopResult, AgentLoopError>>>,
 }
 
 impl<R> AgentLoopHandle<R>
@@ -231,16 +231,17 @@ where
     }
 
     /// Wait for the loop to become idle, abort, or reach a known end reason.
-    pub async fn wait(self) -> Result<AgentLoopResult, AgentLoopError> {
-        let AgentLoopHandle {
-            commands_tx, task, ..
-        } = self;
-        drop(commands_tx);
+    pub async fn wait(mut self) -> Result<AgentLoopResult, AgentLoopError> {
+        drop(self.commands_tx.take());
+        let task = self.task.take().expect("agent loop task is missing");
+        let mut abort_on_drop = AbortOnDrop::new(task.abort_handle());
 
-        match task.await {
+        let result = match task.await {
             Ok(result) => result,
             Err(err) => Err(AgentLoopError::TaskJoin(err)),
-        }
+        };
+        abort_on_drop.disarm();
+        result
     }
 
     /// Queue a message to run before follow-ups after the current prompt settles.
@@ -311,6 +312,8 @@ where
 
     fn send(&self, command: Command) -> Result<(), AgentLoopError> {
         self.commands_tx
+            .as_ref()
+            .ok_or(AgentLoopError::CommandChannelClosed)?
             .send(command)
             .map_err(|_| AgentLoopError::CommandChannelClosed)
     }
@@ -320,7 +323,43 @@ where
     }
 }
 
+impl<R> Drop for AgentLoopHandle<R>
+where
+    R: Clone,
+{
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+struct AbortOnDrop {
+    handle: Option<AbortHandle>,
+}
+
+impl AbortOnDrop {
+    fn new(handle: AbortHandle) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.handle = None;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EndReason {
     /// The prompt and all queued steering/follow-up messages completed.
     Idle,
@@ -355,6 +394,7 @@ pub struct ApiErrorInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ApiErrorKind {
     Http,
     Json,
@@ -373,6 +413,7 @@ pub struct TurnHookContext {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum TurnHookAction {
     /// Keep `TurnHookContext::history` as the loop's active history.
     Continue,
@@ -390,6 +431,7 @@ pub struct AgentLoopResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QueueKind {
     Steer,
     FollowUp,
@@ -428,9 +470,19 @@ pub enum AgentLoopEvent<R> {
     LoopEnded {
         end_reason: EndReason,
     },
+    LoopFailed {
+        error: AgentLoopErrorInfo,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AgentLoopErrorInfo {
+    pub message: String,
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum AgentLoopError {
     CommandChannelClosed,
     InvalidHistory(InvalidHistoryError),
@@ -466,6 +518,14 @@ impl Error for AgentLoopError {
 impl From<StreamingError> for AgentLoopError {
     fn from(err: StreamingError) -> Self {
         Self::Rig(err)
+    }
+}
+
+impl AgentLoopErrorInfo {
+    fn from_error(err: &AgentLoopError) -> Self {
+        Self {
+            message: err.to_string(),
+        }
     }
 }
 
@@ -578,41 +638,47 @@ where
     last_response: Option<String>,
 }
 
+struct RunnerInit<M, P, S>
+where
+    M: CompletionModel,
+    P: PromptHook<M>,
+{
+    agent: Arc<Agent<M, P>>,
+    app_state: Arc<S>,
+    max_turns: usize,
+    turn_timeout: Option<Duration>,
+    loop_timeout: Option<Duration>,
+    turn_hook: Option<TurnHook<S>>,
+    events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
+    state: SharedMessages,
+    turn_running: SharedTurnRunning,
+    initial_turn: PendingTurn,
+}
+
 impl<M, P, S> Runner<M, P, S>
 where
     M: CompletionModel,
     P: PromptHook<M>,
 {
-    fn new(
-        agent: Arc<Agent<M, P>>,
-        app_state: Arc<S>,
-        max_turns: usize,
-        turn_timeout: Option<Duration>,
-        loop_timeout: Option<Duration>,
-        turn_hook: Option<TurnHook<S>>,
-        events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
-        state: SharedMessages,
-        turn_running: SharedTurnRunning,
-        initial_turn: PendingTurn,
-    ) -> Self {
-        let (immediate, resumes) = match initial_turn {
+    fn new(init: RunnerInit<M, P, S>) -> Self {
+        let (immediate, resumes) = match init.initial_turn {
             PendingTurn::Prompt { prelude, prompt } => {
                 debug_assert!(prelude.is_empty());
-                (VecDeque::from([prompt]), 0)
+                (VecDeque::from([*prompt]), 0)
             }
             PendingTurn::Resume => (VecDeque::new(), 1),
         };
 
         Self {
-            agent,
-            app_state,
-            max_turns,
-            turn_timeout,
-            loop_timeout,
-            turn_hook,
-            events_tx,
-            state,
-            turn_running,
+            agent: init.agent,
+            app_state: init.app_state,
+            max_turns: init.max_turns,
+            turn_timeout: init.turn_timeout,
+            loop_timeout: init.loop_timeout,
+            turn_hook: init.turn_hook,
+            events_tx: init.events_tx,
+            state: init.state,
+            turn_running: init.turn_running,
             immediate,
             steering: VecDeque::new(),
             resumes,
@@ -679,7 +745,7 @@ where
 enum PendingTurn {
     Prompt {
         prelude: Vec<Message>,
-        prompt: Message,
+        prompt: Box<Message>,
     },
     Resume,
 }
@@ -689,14 +755,14 @@ impl PendingTurn {
         let prompt = messages.pop()?;
         Some(Self::Prompt {
             prelude: messages,
-            prompt,
+            prompt: Box::new(prompt),
         })
     }
 
     fn single(prompt: Message) -> Self {
         Self::Prompt {
             prelude: Vec::new(),
-            prompt,
+            prompt: Box::new(prompt),
         }
     }
 }
@@ -716,6 +782,7 @@ impl PreparedTurn {
     ) -> Result<Self, AgentLoopError> {
         match turn {
             PendingTurn::Prompt { prelude, prompt } => {
+                let prompt = *prompt;
                 let mut request_history = committed_base_history.clone();
                 request_history.extend(prelude.clone());
                 let mut full_request_history = request_history.clone();
@@ -782,6 +849,21 @@ where
         mut self,
         mut commands_rx: mpsc::UnboundedReceiver<Command>,
     ) -> Result<AgentLoopResult, AgentLoopError> {
+        let result = self.run_inner(&mut commands_rx).await;
+        if let Err(err) = &result {
+            self.set_turn_running(false);
+            self.emit(AgentLoopEvent::LoopFailed {
+                error: AgentLoopErrorInfo::from_error(err),
+            });
+        }
+
+        result
+    }
+
+    async fn run_inner(
+        &mut self,
+        commands_rx: &mut mpsc::UnboundedReceiver<Command>,
+    ) -> Result<AgentLoopResult, AgentLoopError> {
         self.emit(AgentLoopEvent::LoopStarted);
         let loop_deadline = self
             .loop_timeout
@@ -792,7 +874,7 @@ where
                 return Ok(self.finish(deadline.end_reason()));
             }
 
-            if self.drain_ready_commands(&mut commands_rx) == CommandAction::Abort {
+            if self.drain_ready_commands(commands_rx) == CommandAction::Abort {
                 return Ok(self.finish(EndReason::Aborted));
             }
 
@@ -815,7 +897,7 @@ where
                 continue;
             }
 
-            if self.drain_ready_commands(&mut commands_rx) == CommandAction::Abort {
+            if self.drain_ready_commands(commands_rx) == CommandAction::Abort {
                 return Ok(self.finish(EndReason::Aborted));
             }
 
@@ -823,7 +905,7 @@ where
                 continue;
             };
 
-            match self.run_turn(turn, &mut commands_rx, loop_deadline).await? {
+            match self.run_turn(turn, commands_rx, loop_deadline).await? {
                 PromptAction::Continue => {}
                 PromptAction::Abort => return Ok(self.finish(EndReason::Aborted)),
                 PromptAction::Finish(end_reason) => return Ok(self.finish(end_reason)),
@@ -928,7 +1010,12 @@ where
                         }
                         Err(err) => {
                             if let Some(history) = history_from_error(&err) {
-                                self.commit_recovered_history(&turn.committed_base_history, history).await?;
+                                if let CommitOutcome::Abort(end_reason) = self
+                                    .commit_recovered_history(&turn.committed_base_history, history)
+                                    .await?
+                                {
+                                    return Ok(PromptAction::Finish(end_reason));
+                                }
                             } else {
                                 self.set_turn_running(false);
                             }
@@ -953,7 +1040,7 @@ where
             Command::Interrupt(message) => {
                 let messages = turn.partial_messages(partial_turn);
                 if let CommitOutcome::Abort(end_reason) = self
-                    .commit_append(messages, CommitEvent::TurnInterrupted)
+                    .commit_append(messages, CommitEvent::Interrupted)
                     .await?
                 {
                     return Ok(Some(PromptAction::Finish(end_reason)));
@@ -963,8 +1050,7 @@ where
             }
             Command::Abort => {
                 let messages = turn.partial_messages(partial_turn);
-                self.commit_append(messages, CommitEvent::TurnAborted)
-                    .await?;
+                self.commit_append(messages, CommitEvent::Aborted).await?;
                 return Ok(Some(PromptAction::Abort));
             }
         }
@@ -979,8 +1065,7 @@ where
         deadline: TimeoutDeadline,
     ) -> Result<PromptAction, AgentLoopError> {
         let messages = turn.partial_messages(partial_turn);
-        self.commit_append(messages, CommitEvent::TurnTimedOut)
-            .await?;
+        self.commit_append(messages, CommitEvent::TimedOut).await?;
         Ok(PromptAction::Finish(deadline.end_reason()))
     }
 
@@ -997,16 +1082,15 @@ where
             MultiTurnStreamItem::StreamUserItem(item) => partial_turn.note_user_item(item),
             MultiTurnStreamItem::FinalResponse(final_response) => {
                 self.last_response = Some(final_response.response().to_string());
-                if let Some(messages) = final_response.history() {
-                    if let CommitOutcome::Abort(end_reason) = self
+                if let Some(messages) = final_response.history()
+                    && let CommitOutcome::Abort(end_reason) = self
                         .commit_append(
                             turn.append_messages(messages.to_vec()),
-                            CommitEvent::TurnCommitted,
+                            CommitEvent::Committed,
                         )
                         .await?
-                    {
-                        return Ok(Some(end_reason));
-                    }
+                {
+                    return Ok(Some(end_reason));
                 }
             }
             MultiTurnStreamItem::CompletionCall(_) => {}
@@ -1070,20 +1154,20 @@ where
         &mut self,
         base_history: &[Message],
         recovered_history: Vec<Message>,
-    ) -> Result<(), AgentLoopError> {
-        if recovered_history.len() < base_history.len() {
-            *lock_messages(&self.state) = recovered_history;
-            self.set_turn_running(false);
-            return Ok(());
+    ) -> Result<CommitOutcome, AgentLoopError> {
+        validate_message_history(&recovered_history).map_err(AgentLoopError::InvalidHistory)?;
+
+        if !recovered_history.starts_with(base_history) {
+            return Err(AgentLoopError::InvalidHistory(InvalidHistoryError::new(
+                "recovered history does not extend the committed base history",
+            )));
         }
 
         let append = recovered_history[base_history.len()..].to_vec();
-        self.commit_append(append, CommitEvent::TurnCommitted)
-            .await
-            .map(|_| ())
+        self.commit_append(append, CommitEvent::Committed).await
     }
 
-    fn finish(self, end_reason: EndReason) -> AgentLoopResult {
+    fn finish(&mut self, end_reason: EndReason) -> AgentLoopResult {
         self.emit(AgentLoopEvent::LoopEnded {
             end_reason: end_reason.clone(),
         });
@@ -1091,7 +1175,7 @@ where
         AgentLoopResult {
             end_reason,
             history: self.history_snapshot(),
-            last_response: self.last_response,
+            last_response: self.last_response.take(),
         }
     }
 
@@ -1110,19 +1194,19 @@ where
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommitEvent {
-    TurnCommitted,
-    TurnInterrupted,
-    TurnAborted,
-    TurnTimedOut,
+    Committed,
+    Interrupted,
+    Aborted,
+    TimedOut,
 }
 
 impl CommitEvent {
     fn into_agent_event<R>(self, messages: Vec<Message>) -> AgentLoopEvent<R> {
         match self {
-            Self::TurnCommitted => AgentLoopEvent::TurnCommitted { messages },
-            Self::TurnInterrupted => AgentLoopEvent::TurnInterrupted { messages },
-            Self::TurnAborted => AgentLoopEvent::TurnAborted { messages },
-            Self::TurnTimedOut => AgentLoopEvent::TurnTimedOut { messages },
+            Self::Committed => AgentLoopEvent::TurnCommitted { messages },
+            Self::Interrupted => AgentLoopEvent::TurnInterrupted { messages },
+            Self::Aborted => AgentLoopEvent::TurnAborted { messages },
+            Self::TimedOut => AgentLoopEvent::TurnTimedOut { messages },
         }
     }
 }
@@ -1477,7 +1561,7 @@ mod tests {
         test_utils::{MockAddTool, MockCompletionModel, MockResponse, MockStreamEvent},
         tool::Tool,
     };
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
     use tokio::{
         sync::Notify,
         time::{Duration, sleep, timeout},
@@ -1667,21 +1751,32 @@ mod tests {
             MockStreamEvent::final_response_with_default_usage(),
         ]]);
         let agent = AgentBuilder::new(model.clone()).build();
-        let agent_loop = AgentLoop::new(agent).with_turn_hook(|_, _turn| async {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "hook failed",
-            ))
-        });
+        let agent_loop = AgentLoop::new(agent)
+            .with_turn_hook(|_, _turn| async { Err(std::io::Error::other("hook failed")) });
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
 
-        let err = agent_loop
-            .prompt(Message::user("start"))
+        let err = handle
             .wait()
             .await
             .expect_err("turn hook failure should fail the run");
 
         assert!(matches!(err, AgentLoopError::TurnHook(_)));
         assert_eq!(model.request_count(), 1);
+
+        let events = drain_events(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentLoopEvent::LoopFailed { error }
+                    if error.message.contains("turn hook failed: hook failed")
+            )
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentLoopEvent::LoopEnded { .. }))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1916,6 +2011,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dropping_handle_aborts_running_loop() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let agent = AgentBuilder::new(BlockingStreamModel {
+            entered: entered.clone(),
+            release,
+            dropped: dropped.clone(),
+        })
+        .build();
+        let agent_loop = AgentLoop::new(agent);
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
+
+        entered.notified().await;
+        drop(handle);
+
+        timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("dropping the handle should abort the in-flight stream");
+        let events = drain_events(&mut events);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentLoopEvent::LoopEnded { .. } | AgentLoopEvent::LoopFailed { .. }
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_wait_aborts_running_loop() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let agent = AgentBuilder::new(BlockingStreamModel {
+            entered: entered.clone(),
+            release,
+            dropped: dropped.clone(),
+        })
+        .build();
+        let agent_loop = AgentLoop::new(agent);
+        let handle = agent_loop.prompt(Message::user("start"));
+
+        entered.notified().await;
+        let mut wait = Box::pin(handle.wait());
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        drop(wait);
+
+        timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("cancelling wait should abort the in-flight stream");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn turn_hook_receives_candidate_history_and_new_messages() {
         let model = MockCompletionModel::from_stream_turns([[
             MockStreamEvent::text("first"),
@@ -2028,6 +2175,7 @@ mod tests {
         let agent = AgentBuilder::new(BlockingStreamModel {
             entered: entered.clone(),
             release: release.clone(),
+            dropped: Arc::new(Notify::new()),
         })
         .build();
         let seen = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
@@ -2116,6 +2264,82 @@ mod tests {
         );
         assert!(result.history.is_empty());
         assert_eq!(&seen.lock().unwrap()[..], &[(0, 0)]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovered_history_from_max_turns_commits_through_hook() {
+        let model = MockCompletionModel::from_stream_turns([
+            [MockStreamEvent::tool_call(
+                "call_1",
+                "add",
+                serde_json::json!({"x": 1, "y": 2}),
+            )],
+            [MockStreamEvent::tool_call(
+                "call_2",
+                "add",
+                serde_json::json!({"x": 3, "y": 4}),
+            )],
+            [MockStreamEvent::tool_call(
+                "call_3",
+                "add",
+                serde_json::json!({"x": 5, "y": 6}),
+            )],
+        ]);
+        let agent = AgentBuilder::new(model).tool(MockAddTool).build();
+        let seen = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+        let hook_seen = seen.clone();
+        let agent_loop = AgentLoop::new(agent)
+            .max_turns(1)
+            .with_turn_hook(move |_, turn| {
+                let hook_seen = hook_seen.clone();
+                async move {
+                    hook_seen
+                        .lock()
+                        .unwrap()
+                        .push((turn.history.len(), turn.new_messages.len()));
+                    Ok::<_, std::io::Error>(TurnHookAction::Continue)
+                }
+            });
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
+
+        let result = handle.wait().await.unwrap();
+
+        assert_eq!(result.end_reason, EndReason::MaxTurns { max_turns: 1 });
+        let committed_len = result.history.len();
+        assert!(committed_len >= 3);
+        assert_eq!(&seen.lock().unwrap()[..], &[(committed_len, committed_len)]);
+        let events = drain_events(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentLoopEvent::TurnCommitted { messages } if messages.len() == committed_len)
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovered_history_must_extend_committed_base() {
+        let base = vec![Message::user("start"), Message::assistant("base")];
+        let state = Arc::new(Mutex::new(base.clone()));
+        let (events_tx, mut events) = broadcast::channel(EVENT_BUFFER_SIZE);
+        let mut runner = test_runner(state.clone(), events_tx);
+
+        for recovered_history in [
+            vec![Message::user("different")],
+            vec![Message::user("start"), Message::assistant("different")],
+        ] {
+            let err = runner
+                .commit_recovered_history(&base, recovered_history)
+                .await
+                .expect_err("non-appendable recovered history should fail");
+            assert!(matches!(err, AgentLoopError::InvalidHistory(_)));
+            assert_eq!(*lock_messages(&state), base);
+        }
+
+        let events = drain_events(&mut events);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentLoopEvent::TurnCommitted { .. }))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2592,6 +2816,7 @@ mod tests {
     struct BlockingStreamModel {
         entered: Arc<Notify>,
         release: Arc<Notify>,
+        dropped: Arc<Notify>,
     }
 
     impl CompletionModel for BlockingStreamModel {
@@ -2603,6 +2828,7 @@ mod tests {
             Self {
                 entered: Arc::new(Notify::new()),
                 release: Arc::new(Notify::new()),
+                dropped: Arc::new(Notify::new()),
             }
         }
 
@@ -2619,6 +2845,7 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            let _drop = NotifyOnDrop(self.dropped.clone());
             self.entered.notify_one();
             self.release.notified().await;
             let stream: rig::streaming::StreamingResult<Self::StreamingResponse> =
@@ -2627,6 +2854,36 @@ mod tests {
                 >());
             Ok(StreamingCompletionResponse::stream(stream))
         }
+    }
+
+    struct NotifyOnDrop(Arc<Notify>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    fn test_runner(
+        state: SharedMessages,
+        events_tx: broadcast::Sender<AgentLoopEvent<MockResponse>>,
+    ) -> Runner<MockCompletionModel, (), ()> {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = Arc::new(AgentBuilder::new(model).build());
+        Runner::new(RunnerInit {
+            agent,
+            app_state: Arc::new(()),
+            max_turns: 100,
+            turn_timeout: None,
+            loop_timeout: None,
+            turn_hook: None,
+            events_tx,
+            state,
+            turn_running: Arc::new(AtomicBool::new(false)),
+            initial_turn: PendingTurn::Resume,
+        })
     }
 
     fn drain_events<R: Clone>(
