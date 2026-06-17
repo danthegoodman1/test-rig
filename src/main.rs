@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use agentloop::AgentLoop;
+use agentloop::{AgentLoop, TurnHookAction};
 use rig::{
     agent::AgentBuilder,
     completion::ToolDefinition,
@@ -119,33 +119,36 @@ async fn main() -> anyhow::Result<()> {
 
     let agent_loop = AgentLoop::new(agent)
         .with_app_state(app_state)
-        .with_persistence_hook(|state, messages| async move {
-            let mut cursor = state.cursor.lock().unwrap();
-            let mut store = state.store.lock().unwrap();
-            let start_index =
-                store.append(&cursor.agent_id, cursor.generation_id, messages.clone());
+        .with_turn_hook(|state, turn| async move {
+            if !turn.new_messages.is_empty() {
+                let mut cursor = state.cursor.lock().unwrap();
+                let mut store = state.store.lock().unwrap();
+                let start_index = store.append(
+                    &cursor.agent_id,
+                    cursor.generation_id,
+                    turn.new_messages.clone(),
+                );
 
-            println!(
-                "persist> agent={} generation={} append index={} count={}",
-                cursor.agent_id,
-                cursor.generation_id,
-                start_index,
-                messages.len()
-            );
+                println!(
+                    "persist> agent={} generation={} append index={} count={}",
+                    cursor.agent_id,
+                    cursor.generation_id,
+                    start_index,
+                    turn.new_messages.len()
+                );
 
-            cursor.next_message_index = start_index + messages.len();
-            Ok::<(), std::convert::Infallible>(())
-        })
-        .with_context_transform(|state, messages| async move {
-            if messages.len() < 4 {
-                return Ok::<_, std::convert::Infallible>(messages);
+                cursor.next_message_index = start_index + turn.new_messages.len();
+            }
+
+            if turn.history.len() < 4 {
+                return Ok::<_, std::convert::Infallible>(TurnHookAction::Continue);
             }
 
             let summary = vec![Message::system(format!(
                 "Compacted summary: previous generation contained {} messages. \
                      The user asked to start with an echo tool call; the tool returned \
                      a draft input result; the agent completed that turn.",
-                messages.len()
+                turn.history.len()
             ))];
 
             let mut cursor = state.cursor.lock().unwrap();
@@ -165,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
             cursor.generation_id = next_generation_id;
             cursor.next_message_index = start_index + summary.len();
 
-            Ok(summary)
+            Ok(TurnHookAction::ReplaceHistory(summary))
         });
     let handle = agent_loop.prompt(Message::user(
         "Start by calling the echo tool with a draft input.",
