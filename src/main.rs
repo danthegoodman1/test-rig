@@ -59,7 +59,14 @@ impl Tool for EchoTool {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let agent = AgentBuilder::new(scripted_model()).tool(EchoTool).build();
-    let agent_loop = AgentLoop::new(agent);
+    let agent_loop = AgentLoop::new(agent).with_persistence_hook(|messages| async move {
+        let rendered = serde_json::to_string_pretty(&messages)?;
+        println!(
+            "persist> appending {} message(s):\n{rendered}",
+            messages.len()
+        );
+        Ok::<(), serde_json::Error>(())
+    });
     let handle = agent_loop.prompt(Message::user(
         "Start by calling the echo tool with a draft input.",
     ));

@@ -2,13 +2,15 @@ use std::{
     collections::{HashMap, VecDeque},
     error::Error,
     fmt,
+    future::Future,
+    pin::Pin,
     sync::Arc,
 };
 
 use futures::StreamExt;
 use rig::{
     OneOrMany,
-    agent::{Agent, FinalResponse, MultiTurnStreamItem, PromptHook, StreamingError},
+    agent::{Agent, MultiTurnStreamItem, PromptHook, StreamingError},
     completion::{CompletionModel, GetTokenUsage, PromptError},
     message::{AssistantContent, Message, ToolCall, ToolResult, UserContent},
     streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt},
@@ -19,6 +21,11 @@ use tokio::{
     task::JoinHandle,
 };
 
+pub type PersistError = Box<dyn Error + Send + Sync + 'static>;
+
+type PersistenceFuture = Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send>>;
+type PersistenceHook = Arc<dyn Fn(Vec<Message>) -> PersistenceFuture + Send + Sync>;
+
 /// A small harness around `rig::agent::Agent` that owns the queue between prompts.
 pub struct AgentLoop<M, P = ()>
 where
@@ -27,6 +34,7 @@ where
 {
     agent: Arc<Agent<M, P>>,
     max_turns: usize,
+    persistence_hook: Option<PersistenceHook>,
 }
 
 impl<M, P> AgentLoop<M, P>
@@ -38,11 +46,30 @@ where
         Self {
             agent: Arc::new(agent),
             max_turns: 100,
+            persistence_hook: None,
         }
     }
 
     pub fn max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = max_turns;
+        self
+    }
+
+    /// Persist committed messages at the end of each turn before the loop advances.
+    ///
+    /// The hook receives only the messages that should be appended. For interrupted
+    /// turns this is limited to completed tool-call roundtrips; if nothing was
+    /// committed, the hook is not called.
+    pub fn with_persistence_hook<F, Fut, E>(mut self, hook: F) -> Self
+    where
+        F: Fn(Vec<Message>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        E: Error + Send + Sync + 'static,
+    {
+        self.persistence_hook = Some(Arc::new(move |messages| {
+            let future = hook(messages);
+            Box::pin(async move { future.await.map_err(|err| Box::new(err) as PersistError) })
+        }));
         self
     }
 }
@@ -56,7 +83,12 @@ where
     /// Start the loop with an initial user prompt and return a control handle.
     pub fn prompt(&self, prompt: impl Into<Message>) -> AgentLoopHandle {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let runner = Runner::new(self.agent.clone(), self.max_turns, prompt.into());
+        let runner = Runner::new(
+            self.agent.clone(),
+            self.max_turns,
+            self.persistence_hook.clone(),
+            prompt.into(),
+        );
         let task = tokio::spawn(async move { runner.run(commands_rx).await });
 
         AgentLoopHandle { commands_tx, task }
@@ -123,6 +155,7 @@ pub struct AgentLoopResult {
 #[derive(Debug)]
 pub enum AgentLoopError {
     CommandChannelClosed,
+    Persist(PersistError),
     Rig(StreamingError),
     TaskJoin(tokio::task::JoinError),
 }
@@ -131,6 +164,7 @@ impl fmt::Display for AgentLoopError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CommandChannelClosed => f.write_str("agent loop command channel is closed"),
+            Self::Persist(err) => write!(f, "persistence hook failed: {err}"),
             Self::Rig(err) => write!(f, "{err}"),
             Self::TaskJoin(err) => write!(f, "{err}"),
         }
@@ -140,6 +174,7 @@ impl fmt::Display for AgentLoopError {
 impl Error for AgentLoopError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Persist(err) => Some(err.as_ref()),
             Self::Rig(err) => Some(err),
             Self::TaskJoin(err) => Some(err),
             Self::CommandChannelClosed => None,
@@ -167,6 +202,7 @@ where
 {
     agent: Arc<Agent<M, P>>,
     max_turns: usize,
+    persistence_hook: Option<PersistenceHook>,
     immediate: VecDeque<Message>,
     steering: VecDeque<Message>,
     follow_ups: VecDeque<Message>,
@@ -179,10 +215,16 @@ where
     M: CompletionModel,
     P: PromptHook<M>,
 {
-    fn new(agent: Arc<Agent<M, P>>, max_turns: usize, prompt: Message) -> Self {
+    fn new(
+        agent: Arc<Agent<M, P>>,
+        max_turns: usize,
+        persistence_hook: Option<PersistenceHook>,
+        prompt: Message,
+    ) -> Self {
         Self {
             agent,
             max_turns,
+            persistence_hook,
             immediate: VecDeque::from([prompt]),
             steering: VecDeque::new(),
             follow_ups: VecDeque::new(),
@@ -289,15 +331,15 @@ where
                         Command::Steer(message) => self.steering.push_back(message),
                         Command::FollowUp(message) => self.follow_ups.push_back(message),
                         Command::Interrupt(message) => {
-                            if let Some(history) = partial_turn.committed_history(&base_history, &prompt) {
-                                self.history = history;
+                            if let Some(messages) = partial_turn.append_messages(&prompt) {
+                                self.commit_append(messages).await?;
                             }
                             self.immediate.push_front(message);
                             return Ok(PromptAction::Continue);
                         }
                         Command::Abort => {
-                            if let Some(history) = partial_turn.committed_history(&base_history, &prompt) {
-                                self.history = history;
+                            if let Some(messages) = partial_turn.append_messages(&prompt) {
+                                self.commit_append(messages).await?;
                             }
                             return Ok(PromptAction::Abort);
                         }
@@ -309,10 +351,10 @@ where
                     };
 
                     match item {
-                        Ok(item) => self.handle_stream_item(item, &mut partial_turn),
+                        Ok(item) => self.handle_stream_item(item, &mut partial_turn).await?,
                         Err(err) => {
                             if let Some(history) = history_from_error(&err) {
-                                self.history = history;
+                                self.commit_recovered_history(&base_history, history).await?;
                             }
                             return Err(err.into());
                         }
@@ -322,30 +364,56 @@ where
         }
     }
 
-    fn handle_stream_item(
+    async fn handle_stream_item(
         &mut self,
         item: MultiTurnStreamItem<M::StreamingResponse>,
         partial_turn: &mut PartialTurn,
-    ) {
+    ) -> Result<(), AgentLoopError> {
         match item {
             MultiTurnStreamItem::StreamAssistantItem(item) => {
                 partial_turn.note_assistant_item(item)
             }
             MultiTurnStreamItem::StreamUserItem(item) => partial_turn.note_user_item(item),
             MultiTurnStreamItem::FinalResponse(final_response) => {
-                self.commit_final_response(&final_response);
+                self.last_response = Some(final_response.response().to_string());
+                if let Some(messages) = final_response.history() {
+                    self.commit_append(messages.to_vec()).await?;
+                }
             }
             MultiTurnStreamItem::CompletionCall(_) => {}
             _ => {}
         }
+
+        Ok(())
     }
 
-    fn commit_final_response(&mut self, final_response: &FinalResponse) {
-        self.last_response = Some(final_response.response().to_string());
-
-        if let Some(messages) = final_response.history() {
-            self.history.extend(messages.iter().cloned());
+    async fn commit_append(&mut self, messages: Vec<Message>) -> Result<(), AgentLoopError> {
+        if messages.is_empty() {
+            return Ok(());
         }
+
+        if let Some(hook) = &self.persistence_hook {
+            hook(messages.clone())
+                .await
+                .map_err(AgentLoopError::Persist)?;
+        }
+
+        self.history.extend(messages);
+        Ok(())
+    }
+
+    async fn commit_recovered_history(
+        &mut self,
+        base_history: &[Message],
+        recovered_history: Vec<Message>,
+    ) -> Result<(), AgentLoopError> {
+        if recovered_history.len() < base_history.len() {
+            self.history = recovered_history;
+            return Ok(());
+        }
+
+        let append = recovered_history[base_history.len()..].to_vec();
+        self.commit_append(append).await
     }
 }
 
@@ -384,11 +452,7 @@ impl PartialTurn {
         self.completed_tool_results.push(tool_result);
     }
 
-    fn committed_history(
-        &self,
-        base_history: &[Message],
-        prompt: &Message,
-    ) -> Option<Vec<Message>> {
+    fn append_messages(&self, prompt: &Message) -> Option<Vec<Message>> {
         if self.completed_tool_calls.is_empty() {
             return None;
         }
@@ -410,16 +474,16 @@ impl PartialTurn {
         )
         .ok()?;
 
-        let mut history = base_history.to_vec();
-        history.push(prompt.clone());
-        history.push(Message::Assistant {
-            id: None,
-            content: assistant_content,
-        });
-        history.push(Message::User {
-            content: user_content,
-        });
-        Some(history)
+        Some(vec![
+            prompt.clone(),
+            Message::Assistant {
+                id: None,
+                content: assistant_content,
+            },
+            Message::User {
+                content: user_content,
+            },
+        ])
     }
 }
 
@@ -458,6 +522,7 @@ mod tests {
         message::UserContent,
         test_utils::{MockCompletionModel, MockStreamEvent},
     };
+    use std::sync::{Arc, Mutex};
 
     #[tokio::test(flavor = "current_thread")]
     async fn follow_up_keeps_loop_running_after_first_response() {
@@ -532,6 +597,56 @@ mod tests {
         assert_eq!(result.end_reason, EndReason::Aborted);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn persistence_hook_receives_messages_to_append() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("first"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+        let persisted = Arc::new(Mutex::new(Vec::<Vec<Message>>::new()));
+        let seen = persisted.clone();
+        let agent_loop = AgentLoop::new(agent).with_persistence_hook(move |messages| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(messages);
+                Ok::<(), std::io::Error>(())
+            }
+        });
+
+        let result = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .unwrap();
+
+        assert_eq!(result.end_reason, EndReason::Idle);
+        let persisted = persisted.lock().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].len(), 2);
+        assert_eq!(first_user_text(&persisted[0][0]).as_deref(), Some("start"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn persistence_hook_error_stops_the_loop() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("first"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+        let agent_loop = AgentLoop::new(agent).with_persistence_hook(|_messages| async {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
+        });
+
+        let err = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .expect_err("persist failure should fail the run");
+
+        assert!(matches!(err, AgentLoopError::Persist(_)));
+    }
+
     #[test]
     fn partial_turn_commits_completed_tool_results() {
         let mut partial = PartialTurn::default();
@@ -556,14 +671,14 @@ mod tests {
             tool_result,
         });
 
-        let history = partial
-            .committed_history(&[], &Message::user("start"))
+        let messages = partial
+            .append_messages(&Message::user("start"))
             .expect("completed tool results should produce history");
 
-        assert_eq!(history.len(), 3);
-        assert!(matches!(history[1], Message::Assistant { .. }));
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(messages[1], Message::Assistant { .. }));
         assert!(
-            matches!(&history[2], Message::User { content } if matches!(content.first(), UserContent::ToolResult(_)))
+            matches!(&messages[2], Message::User { content } if matches!(content.first(), UserContent::ToolResult(_)))
         );
     }
 
