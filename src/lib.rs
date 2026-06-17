@@ -646,7 +646,9 @@ where
         let committed_base_history = self.history_snapshot();
         let mut request_history = committed_base_history.clone();
         request_history.extend(turn.prelude.clone());
-        validate_message_history(&request_history).map_err(AgentLoopError::InvalidHistory)?;
+        let mut full_request_history = request_history.clone();
+        full_request_history.push(turn.prompt.clone());
+        validate_message_history(&full_request_history).map_err(AgentLoopError::InvalidHistory)?;
 
         self.emit(AgentLoopEvent::TurnStarted {
             prompt: turn.prompt.clone(),
