@@ -11,7 +11,7 @@ use futures::StreamExt;
 use rig::{
     OneOrMany,
     agent::{Agent, MultiTurnStreamItem, PromptHook, StreamingError},
-    completion::{CompletionModel, GetTokenUsage, PromptError},
+    completion::{CompletionError, CompletionModel, GetTokenUsage, PromptError},
     message::{AssistantContent, Message, ToolCall, ToolResult, UserContent},
     streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt},
     wasm_compat::WasmCompatSend,
@@ -25,9 +25,13 @@ use tokio::{
 };
 
 pub type PersistError = Box<dyn Error + Send + Sync + 'static>;
+pub type ContextTransformError = Box<dyn Error + Send + Sync + 'static>;
 
 type PersistenceFuture = Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send>>;
 type PersistenceHook = Arc<dyn Fn(Vec<Message>) -> PersistenceFuture + Send + Sync>;
+type ContextTransformFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<Message>, ContextTransformError>> + Send>>;
+type ContextTransformHook = Arc<dyn Fn(Vec<Message>) -> ContextTransformFuture + Send + Sync>;
 type SharedMessages = Arc<Mutex<Vec<Message>>>;
 const EVENT_BUFFER_SIZE: usize = 1024;
 
@@ -46,7 +50,9 @@ where
 {
     agent: Arc<Agent<M, P>>,
     max_turns: usize,
+    initial_history: Vec<Message>,
     persistence_hook: Option<PersistenceHook>,
+    context_transform: Option<ContextTransformHook>,
 }
 
 impl<M, P> AgentLoop<M, P>
@@ -58,12 +64,24 @@ where
         Self {
             agent: Arc::new(agent),
             max_turns: 100,
+            initial_history: Vec::new(),
             persistence_hook: None,
+            context_transform: None,
         }
     }
 
     pub fn max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = max_turns;
+        self
+    }
+
+    /// Seed the loop's active in-memory history.
+    pub fn with_history<H, T>(mut self, history: H) -> Self
+    where
+        H: IntoIterator<Item = T>,
+        T: Into<Message>,
+    {
+        self.initial_history = history.into_iter().map(Into::into).collect();
         self
     }
 
@@ -84,6 +102,28 @@ where
         }));
         self
     }
+
+    /// Transform the active in-memory history at a turn boundary.
+    ///
+    /// The hook runs after any prior turn messages have been committed and before
+    /// the next Rig request is built. It receives the current active history and
+    /// returns the history that should be used going forward.
+    pub fn with_context_transform<F, Fut, E>(mut self, transform: F) -> Self
+    where
+        F: Fn(Vec<Message>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<Message>, E>> + Send + 'static,
+        E: Error + Send + Sync + 'static,
+    {
+        self.context_transform = Some(Arc::new(move |messages| {
+            let future = transform(messages);
+            Box::pin(async move {
+                future
+                    .await
+                    .map_err(|err| Box::new(err) as ContextTransformError)
+            })
+        }));
+        self
+    }
 }
 
 impl<M, P> AgentLoop<M, P>
@@ -96,11 +136,12 @@ where
     pub fn prompt(&self, prompt: impl Into<Message>) -> AgentLoopHandle<M::StreamingResponse> {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let (events_tx, _) = broadcast::channel(EVENT_BUFFER_SIZE);
-        let state = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(Mutex::new(self.initial_history.clone()));
         let runner = Runner::new(
             self.agent.clone(),
             self.max_turns,
             self.persistence_hook.clone(),
+            self.context_transform.clone(),
             events_tx.clone(),
             state.clone(),
             prompt.into(),
@@ -141,7 +182,7 @@ where
         lock_messages(&self.state).clone()
     }
 
-    /// Wait for the loop to become idle, abort, or error.
+    /// Wait for the loop to become idle, abort, or reach a known end reason.
     pub async fn wait(self) -> Result<AgentLoopResult, AgentLoopError> {
         match self.task.await {
             Ok(result) => result,
@@ -150,6 +191,9 @@ where
     }
 
     /// Queue a message to run before follow-ups after the current prompt settles.
+    ///
+    /// All steering messages ready for the next turn are applied together, in
+    /// queue order.
     pub fn steer(&self, message: impl Into<Message>) -> Result<(), AgentLoopError> {
         let message = message.into();
         self.send(Command::Steer(message.clone()))?;
@@ -161,6 +205,8 @@ where
     }
 
     /// Queue a message to run after the current prompt would otherwise leave the loop idle.
+    ///
+    /// Follow-ups are applied one turn at a time.
     pub fn follow_up(&self, message: impl Into<Message>) -> Result<(), AgentLoopError> {
         let message = message.into();
         self.send(Command::FollowUp(message.clone()))?;
@@ -209,6 +255,36 @@ pub enum EndReason {
     Idle,
     /// The caller aborted the loop.
     Aborted,
+    /// The provider refused or filtered the request or response.
+    ContentFilter { error: ApiErrorInfo },
+    /// The provider rejected the request because the context was too large.
+    ContextFull { error: ApiErrorInfo },
+    /// The provider stopped because an output/token limit was reached.
+    Length { error: ApiErrorInfo },
+    /// Rig stopped after exceeding the configured multi-turn tool-call limit.
+    MaxTurns { max_turns: usize },
+    /// The turn failed while using tools.
+    ToolError { message: String },
+    /// The provider or client returned an API/request/response error.
+    ApiError { error: ApiErrorInfo },
+    /// A non-API error ended the loop.
+    Other { message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiErrorInfo {
+    pub kind: ApiErrorKind,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApiErrorKind {
+    Http,
+    Json,
+    Url,
+    Request,
+    Response,
+    Provider,
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +323,9 @@ pub enum AgentLoopEvent<R> {
     TurnAborted {
         messages: Vec<Message>,
     },
+    ContextTransformed {
+        messages: Vec<Message>,
+    },
     Persisted {
         messages: Vec<Message>,
     },
@@ -259,6 +338,7 @@ pub enum AgentLoopEvent<R> {
 pub enum AgentLoopError {
     CommandChannelClosed,
     Persist(PersistError),
+    ContextTransform(ContextTransformError),
     Rig(StreamingError),
     TaskJoin(tokio::task::JoinError),
 }
@@ -268,6 +348,7 @@ impl fmt::Display for AgentLoopError {
         match self {
             Self::CommandChannelClosed => f.write_str("agent loop command channel is closed"),
             Self::Persist(err) => write!(f, "persistence hook failed: {err}"),
+            Self::ContextTransform(err) => write!(f, "context transform failed: {err}"),
             Self::Rig(err) => write!(f, "{err}"),
             Self::TaskJoin(err) => write!(f, "{err}"),
         }
@@ -278,6 +359,7 @@ impl Error for AgentLoopError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Persist(err) => Some(err.as_ref()),
+            Self::ContextTransform(err) => Some(err.as_ref()),
             Self::Rig(err) => Some(err),
             Self::TaskJoin(err) => Some(err),
             Self::CommandChannelClosed => None,
@@ -306,6 +388,7 @@ where
     agent: Arc<Agent<M, P>>,
     max_turns: usize,
     persistence_hook: Option<PersistenceHook>,
+    context_transform: Option<ContextTransformHook>,
     events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
     state: SharedMessages,
     immediate: VecDeque<Message>,
@@ -323,6 +406,7 @@ where
         agent: Arc<Agent<M, P>>,
         max_turns: usize,
         persistence_hook: Option<PersistenceHook>,
+        context_transform: Option<ContextTransformHook>,
         events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
         state: SharedMessages,
         prompt: Message,
@@ -331,6 +415,7 @@ where
             agent,
             max_turns,
             persistence_hook,
+            context_transform,
             events_tx,
             state,
             immediate: VecDeque::from([prompt]),
@@ -340,11 +425,20 @@ where
         }
     }
 
-    fn next_prompt(&mut self) -> Option<Message> {
-        self.immediate
-            .pop_front()
-            .or_else(|| self.steering.pop_front())
-            .or_else(|| self.follow_ups.pop_front())
+    fn next_turn(&mut self) -> Option<PendingTurn> {
+        if let Some(message) = self.immediate.pop_front() {
+            return Some(PendingTurn::single(message));
+        }
+
+        if !self.steering.is_empty() {
+            return PendingTurn::new(self.steering.drain(..).collect());
+        }
+
+        self.follow_ups.pop_front().map(PendingTurn::single)
+    }
+
+    fn has_pending_turn(&self) -> bool {
+        !self.immediate.is_empty() || !self.steering.is_empty() || !self.follow_ups.is_empty()
     }
 
     fn handle_idle_command(&mut self, command: Command) -> CommandAction {
@@ -377,6 +471,45 @@ where
     }
 }
 
+struct PendingTurn {
+    prelude: Vec<Message>,
+    prompt: Message,
+}
+
+impl PendingTurn {
+    fn new(mut messages: Vec<Message>) -> Option<Self> {
+        let prompt = messages.pop()?;
+        Some(Self {
+            prelude: messages,
+            prompt,
+        })
+    }
+
+    fn single(prompt: Message) -> Self {
+        Self {
+            prelude: Vec::new(),
+            prompt,
+        }
+    }
+
+    fn append_messages(&self, mut messages: Vec<Message>) -> Vec<Message> {
+        if self.prelude.is_empty() {
+            return messages;
+        }
+
+        let mut append = self.prelude.clone();
+        append.append(&mut messages);
+        append
+    }
+
+    fn partial_messages(&self, partial_turn: &PartialTurn) -> Vec<Message> {
+        partial_turn
+            .append_messages(&self.prompt)
+            .map(|messages| self.append_messages(messages))
+            .unwrap_or_default()
+    }
+}
+
 impl<M, P> Runner<M, P>
 where
     M: CompletionModel + Send + Sync + 'static,
@@ -394,33 +527,64 @@ where
                 return Ok(self.finish(EndReason::Aborted));
             }
 
-            let Some(prompt) = self.next_prompt() else {
+            if !self.has_pending_turn() {
                 return Ok(self.finish(EndReason::Idle));
+            }
+
+            self.transform_context().await?;
+
+            if self.drain_ready_commands(&mut commands_rx) == CommandAction::Abort {
+                return Ok(self.finish(EndReason::Aborted));
+            }
+
+            let Some(turn) = self.next_turn() else {
+                continue;
             };
 
-            match self.run_prompt(prompt, &mut commands_rx).await? {
+            match self.run_turn(turn, &mut commands_rx).await? {
                 PromptAction::Continue => {}
                 PromptAction::Abort => return Ok(self.finish(EndReason::Aborted)),
+                PromptAction::Finish(end_reason) => return Ok(self.finish(end_reason)),
             }
         }
     }
 
-    async fn run_prompt(
+    async fn transform_context(&mut self) -> Result<(), AgentLoopError> {
+        let Some(transform) = &self.context_transform else {
+            return Ok(());
+        };
+
+        let before = self.history_snapshot();
+        let after = transform(before.clone())
+            .await
+            .map_err(AgentLoopError::ContextTransform)?;
+
+        if after != before {
+            *lock_messages(&self.state) = after.clone();
+            self.emit(AgentLoopEvent::ContextTransformed { messages: after });
+        }
+
+        Ok(())
+    }
+
+    async fn run_turn(
         &mut self,
-        prompt: Message,
+        turn: PendingTurn,
         commands_rx: &mut mpsc::UnboundedReceiver<Command>,
     ) -> Result<PromptAction, AgentLoopError> {
         self.emit(AgentLoopEvent::TurnStarted {
-            prompt: prompt.clone(),
+            prompt: turn.prompt.clone(),
         });
 
-        let base_history = self.history_snapshot();
+        let committed_base_history = self.history_snapshot();
+        let mut request_history = committed_base_history.clone();
+        request_history.extend(turn.prelude.clone());
         let mut partial_turn = PartialTurn::default();
         let mut commands_closed = false;
         let mut stream = self
             .agent
-            .stream_prompt(prompt.clone())
-            .with_history(base_history.clone())
+            .stream_prompt(turn.prompt.clone())
+            .with_history(request_history)
             .multi_turn(self.max_turns)
             .await;
 
@@ -436,13 +600,13 @@ where
                         Command::Steer(message) => self.steering.push_back(message),
                         Command::FollowUp(message) => self.follow_ups.push_back(message),
                         Command::Interrupt(message) => {
-                            let messages = partial_turn.append_messages(&prompt).unwrap_or_default();
+                            let messages = turn.partial_messages(&partial_turn);
                             self.commit_append(messages, CommitEvent::TurnInterrupted).await?;
                             self.immediate.push_front(message);
                             return Ok(PromptAction::Continue);
                         }
                         Command::Abort => {
-                            let messages = partial_turn.append_messages(&prompt).unwrap_or_default();
+                            let messages = turn.partial_messages(&partial_turn);
                             self.commit_append(messages, CommitEvent::TurnAborted).await?;
                             return Ok(PromptAction::Abort);
                         }
@@ -456,13 +620,13 @@ where
                     match item {
                         Ok(item) => {
                             self.emit(AgentLoopEvent::Rig(item.clone()));
-                            self.handle_stream_item(item, &mut partial_turn).await?;
+                            self.handle_stream_item(item, &turn, &mut partial_turn).await?;
                         }
                         Err(err) => {
                             if let Some(history) = history_from_error(&err) {
-                                self.commit_recovered_history(&base_history, history).await?;
+                                self.commit_recovered_history(&committed_base_history, history).await?;
                             }
-                            return Err(err.into());
+                            return Ok(PromptAction::Finish(end_reason_from_streaming_error(&err)));
                         }
                     }
                 }
@@ -473,6 +637,7 @@ where
     async fn handle_stream_item(
         &mut self,
         item: MultiTurnStreamItem<M::StreamingResponse>,
+        turn: &PendingTurn,
         partial_turn: &mut PartialTurn,
     ) -> Result<(), AgentLoopError> {
         match item {
@@ -483,8 +648,11 @@ where
             MultiTurnStreamItem::FinalResponse(final_response) => {
                 self.last_response = Some(final_response.response().to_string());
                 if let Some(messages) = final_response.history() {
-                    self.commit_append(messages.to_vec(), CommitEvent::TurnCommitted)
-                        .await?;
+                    self.commit_append(
+                        turn.append_messages(messages.to_vec()),
+                        CommitEvent::TurnCommitted,
+                    )
+                    .await?;
                 }
             }
             MultiTurnStreamItem::CompletionCall(_) => {}
@@ -646,10 +814,11 @@ enum CommandAction {
     Abort,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PromptAction {
     Continue,
     Abort,
+    Finish(EndReason),
 }
 
 fn history_from_error(err: &StreamingError) -> Option<Vec<Message>> {
@@ -665,6 +834,115 @@ fn history_from_error(err: &StreamingError) -> Option<Vec<Message>> {
         | PromptError::ToolError(_)
         | PromptError::ToolServerError(_) => None,
     }
+}
+
+fn end_reason_from_streaming_error(err: &StreamingError) -> EndReason {
+    match err {
+        StreamingError::Completion(err) => end_reason_from_completion_error(err),
+        StreamingError::Prompt(err) => end_reason_from_prompt_error(err),
+        StreamingError::Tool(err) => EndReason::ToolError {
+            message: err.to_string(),
+        },
+    }
+}
+
+fn end_reason_from_prompt_error(err: &PromptError) -> EndReason {
+    match err {
+        PromptError::CompletionError(err) => end_reason_from_completion_error(err),
+        PromptError::ToolError(err) => EndReason::ToolError {
+            message: err.to_string(),
+        },
+        PromptError::ToolServerError(err) => EndReason::ToolError {
+            message: err.to_string(),
+        },
+        PromptError::MaxTurnsError { max_turns, .. } => EndReason::MaxTurns {
+            max_turns: *max_turns,
+        },
+        PromptError::PromptCancelled { reason, .. } => EndReason::Other {
+            message: reason.clone(),
+        },
+        PromptError::UnknownToolCall { tool_name, .. } => EndReason::ToolError {
+            message: format!("unknown tool call: {tool_name}"),
+        },
+    }
+}
+
+fn end_reason_from_completion_error(err: &CompletionError) -> EndReason {
+    let error = ApiErrorInfo::from_completion_error(err);
+
+    if is_content_filter_error(&error.message) {
+        EndReason::ContentFilter { error }
+    } else if is_context_full_error(&error.message) {
+        EndReason::ContextFull { error }
+    } else if is_length_error(&error.message) {
+        EndReason::Length { error }
+    } else {
+        EndReason::ApiError { error }
+    }
+}
+
+impl ApiErrorInfo {
+    fn from_completion_error(err: &CompletionError) -> Self {
+        let (kind, message) = match err {
+            CompletionError::HttpError(err) => (ApiErrorKind::Http, err.to_string()),
+            CompletionError::JsonError(err) => (ApiErrorKind::Json, err.to_string()),
+            CompletionError::UrlError(err) => (ApiErrorKind::Url, err.to_string()),
+            CompletionError::RequestError(err) => (ApiErrorKind::Request, err.to_string()),
+            CompletionError::ResponseError(message) => (ApiErrorKind::Response, message.clone()),
+            CompletionError::ProviderError(message) => (ApiErrorKind::Provider, message.clone()),
+        };
+
+        Self { kind, message }
+    }
+}
+
+fn is_content_filter_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    contains_any(
+        &message,
+        &[
+            "content_filter",
+            "content filter",
+            "safety filter",
+            "policy violation",
+            "responsible_ai_policy",
+            "unsafe prompt",
+            "blocked by policy",
+        ],
+    )
+}
+
+fn is_context_full_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    contains_any(
+        &message,
+        &[
+            "context_length_exceeded",
+            "context length",
+            "context window",
+            "maximum context",
+            "prompt is too long",
+            "too many input tokens",
+        ],
+    )
+}
+
+fn is_length_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    contains_any(
+        &message,
+        &[
+            "max_output_tokens",
+            "max output tokens",
+            "output token limit",
+            "finish_reason: length",
+            "finish reason length",
+        ],
+    )
+}
+
+fn contains_any(message: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| message.contains(needle))
 }
 
 #[cfg(test)]
@@ -705,6 +983,99 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn with_history_seeds_active_state_and_first_request() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("first"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model.clone()).build();
+        let agent_loop = AgentLoop::new(agent).with_history([Message::user("previous")]);
+
+        let result = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .unwrap();
+
+        let requests = model.requests();
+        assert_eq!(
+            user_texts(requests[0].chat_history.iter()),
+            vec!["previous", "start"]
+        );
+        assert_eq!(user_texts(result.history.iter()), vec!["previous", "start"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn context_transform_replaces_active_history_between_turns() {
+        let model = MockCompletionModel::from_stream_turns([
+            [
+                MockStreamEvent::text("first"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            [
+                MockStreamEvent::text("follow"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone()).build();
+        let agent_loop = AgentLoop::new(agent).with_context_transform(|messages| async move {
+            if messages.len() >= 2 {
+                Ok::<_, std::io::Error>(vec![Message::user("summary")])
+            } else {
+                Ok(messages)
+            }
+        });
+
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
+        handle.follow_up(Message::user("follow-up")).unwrap();
+
+        let result = handle.wait().await.unwrap();
+
+        let requests = model.requests();
+        assert_eq!(
+            user_texts(requests[1].chat_history.iter()),
+            vec!["summary", "follow-up"]
+        );
+        assert_eq!(
+            user_texts(result.history.iter()),
+            vec!["summary", "follow-up"]
+        );
+
+        let events = drain_events(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentLoopEvent::ContextTransformed { messages }
+                    if user_texts(messages.iter()) == vec!["summary"]
+            )
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn context_transform_error_stops_the_loop() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("unused"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+        let agent_loop = AgentLoop::new(agent).with_context_transform(|_messages| async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "compact failed",
+            ))
+        });
+
+        let err = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .expect_err("context transform failure should fail the run");
+
+        assert!(matches!(err, AgentLoopError::ContextTransform(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn steering_runs_before_follow_ups() {
         let model = MockCompletionModel::from_stream_turns([
             [
@@ -732,6 +1103,83 @@ mod tests {
         assert_eq!(result.end_reason, EndReason::Idle);
         assert_eq!(model.request_count(), 3);
         assert_eq!(user_prompts(&model), vec!["start", "steer", "follow-up"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn steering_messages_are_applied_together_by_default() {
+        let model = MockCompletionModel::from_stream_turns([
+            [
+                MockStreamEvent::text("first"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            [
+                MockStreamEvent::text("steered"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            [
+                MockStreamEvent::text("followed"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone()).build();
+        let agent_loop = AgentLoop::new(agent);
+
+        let handle = agent_loop.prompt(Message::user("start"));
+        handle.follow_up(Message::user("follow-up")).unwrap();
+        handle.steer(Message::user("steer-one")).unwrap();
+        handle.steer(Message::user("steer-two")).unwrap();
+
+        let result = handle.wait().await.unwrap();
+
+        assert_eq!(result.end_reason, EndReason::Idle);
+        assert_eq!(model.request_count(), 3);
+        assert_eq!(
+            user_prompts(&model),
+            vec!["start", "steer-two", "follow-up"]
+        );
+
+        let requests = model.requests();
+        assert_eq!(
+            user_texts(requests[1].chat_history.iter()),
+            vec!["start", "steer-one", "steer-two"]
+        );
+        assert_eq!(
+            user_texts(result.history.iter()),
+            vec!["start", "steer-one", "steer-two", "follow-up"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn follow_ups_are_applied_one_at_a_time() {
+        let model = MockCompletionModel::from_stream_turns([
+            [
+                MockStreamEvent::text("first"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            [
+                MockStreamEvent::text("follow-one"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            [
+                MockStreamEvent::text("follow-two"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone()).build();
+        let agent_loop = AgentLoop::new(agent);
+
+        let handle = agent_loop.prompt(Message::user("start"));
+        handle.follow_up(Message::user("follow-up-one")).unwrap();
+        handle.follow_up(Message::user("follow-up-two")).unwrap();
+
+        let result = handle.wait().await.unwrap();
+
+        assert_eq!(result.end_reason, EndReason::Idle);
+        assert_eq!(model.request_count(), 3);
+        assert_eq!(
+            user_prompts(&model),
+            vec!["start", "follow-up-one", "follow-up-two"]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -799,6 +1247,94 @@ mod tests {
             .expect_err("persist failure should fail the run");
 
         assert!(matches!(err, AgentLoopError::Persist(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_content_filter_error_returns_end_reason() {
+        let model = MockCompletionModel::from_stream_turns([[MockStreamEvent::error(
+            "content_filter: request blocked by policy",
+        )]]);
+        let agent = AgentBuilder::new(model).build();
+        let agent_loop = AgentLoop::new(agent);
+
+        let result = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result.end_reason,
+            EndReason::ContentFilter { error }
+                if error.kind == ApiErrorKind::Provider
+                    && error.message == "content_filter: request blocked by policy"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_context_full_error_returns_end_reason() {
+        let model = MockCompletionModel::from_stream_turns([[MockStreamEvent::error(
+            "context_length_exceeded: maximum context length exceeded",
+        )]]);
+        let agent = AgentBuilder::new(model).build();
+        let agent_loop = AgentLoop::new(agent);
+
+        let result = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result.end_reason,
+            EndReason::ContextFull { error }
+                if error.kind == ApiErrorKind::Provider
+                    && error.message == "context_length_exceeded: maximum context length exceeded"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_length_error_returns_end_reason() {
+        let model = MockCompletionModel::from_stream_turns([[MockStreamEvent::error(
+            "OpenAI response stream was incomplete: max_output_tokens",
+        )]]);
+        let agent = AgentBuilder::new(model).build();
+        let agent_loop = AgentLoop::new(agent);
+
+        let result = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result.end_reason,
+            EndReason::Length { error }
+                if error.kind == ApiErrorKind::Provider
+                    && error.message == "OpenAI response stream was incomplete: max_output_tokens"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_api_error_returns_end_reason() {
+        let model = MockCompletionModel::from_stream_turns([[MockStreamEvent::error(
+            "server_error: response stream failed",
+        )]]);
+        let agent = AgentBuilder::new(model).build();
+        let agent_loop = AgentLoop::new(agent);
+
+        let result = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result.end_reason,
+            EndReason::ApiError { error }
+                if error.kind == ApiErrorKind::Provider
+                    && error.message == "server_error: response stream failed"
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -963,6 +1499,10 @@ mod tests {
                     .unwrap_or_default()
             })
             .collect()
+    }
+
+    fn user_texts<'a>(messages: impl IntoIterator<Item = &'a Message>) -> Vec<String> {
+        messages.into_iter().filter_map(first_user_text).collect()
     }
 
     fn first_user_text(message: &Message) -> Option<String> {
