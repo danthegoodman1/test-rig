@@ -125,11 +125,13 @@ where
         self
     }
 
-    /// Persist committed messages at the end of each turn before the loop advances.
+    /// Persist a newly committed message batch at the end of each turn.
     ///
-    /// The hook receives app state and only the messages that should be appended.
-    /// For interrupted turns this is limited to completed tool-call roundtrips;
-    /// if nothing was committed, the hook is not called.
+    /// The hook receives `(app_state, new_messages)`. `new_messages` is the
+    /// ordered batch committed by this turn boundary; it is not the full active
+    /// history. For interrupted turns, this batch contains only completed
+    /// tool-call/tool-result roundtrips. If the batch is empty, the hook is not
+    /// called. The hook returns only success or failure.
     pub fn with_persistence_hook<F, Fut, E>(mut self, hook: F) -> Self
     where
         F: Fn(Arc<S>, Vec<Message>) -> Fut + Send + Sync + 'static,
@@ -143,11 +145,12 @@ where
         self
     }
 
-    /// Transform the active in-memory history at a turn boundary.
+    /// Transform the full active in-memory history at a turn boundary.
     ///
-    /// The hook runs after any prior turn messages have been committed and before
-    /// the next Rig request is built. It receives app state and the current active
-    /// history, and returns the history that should be used going forward.
+    /// The hook receives `(app_state, current_history)` and returns
+    /// `next_history`. Both vectors are complete active histories, not append
+    /// batches or deltas. The returned `next_history` replaces the loop's
+    /// in-memory history before the next Rig request is built.
     pub fn with_context_transform<F, Fut, E>(mut self, transform: F) -> Self
     where
         F: Fn(Arc<S>, Vec<Message>) -> Fut + Send + Sync + 'static,
