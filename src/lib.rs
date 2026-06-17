@@ -28,10 +28,11 @@ pub type PersistError = Box<dyn Error + Send + Sync + 'static>;
 pub type ContextTransformError = Box<dyn Error + Send + Sync + 'static>;
 
 type PersistenceFuture = Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send>>;
-type PersistenceHook = Arc<dyn Fn(Vec<Message>) -> PersistenceFuture + Send + Sync>;
+type PersistenceHook<S> = Arc<dyn Fn(Arc<S>, Vec<Message>) -> PersistenceFuture + Send + Sync>;
 type ContextTransformFuture =
     Pin<Box<dyn Future<Output = Result<Vec<Message>, ContextTransformError>> + Send>>;
-type ContextTransformHook = Arc<dyn Fn(Vec<Message>) -> ContextTransformFuture + Send + Sync>;
+type ContextTransformHook<S> =
+    Arc<dyn Fn(Arc<S>, Vec<Message>) -> ContextTransformFuture + Send + Sync>;
 type SharedMessages = Arc<Mutex<Vec<Message>>>;
 const EVENT_BUFFER_SIZE: usize = 1024;
 
@@ -43,19 +44,20 @@ fn lock_messages(messages: &SharedMessages) -> MutexGuard<'_, Vec<Message>> {
 }
 
 /// A small harness around `rig::agent::Agent` that owns the queue between prompts.
-pub struct AgentLoop<M, P = ()>
+pub struct AgentLoop<M, P = (), S = ()>
 where
     M: CompletionModel,
     P: PromptHook<M>,
 {
     agent: Arc<Agent<M, P>>,
+    app_state: Arc<S>,
     max_turns: usize,
     initial_history: Vec<Message>,
-    persistence_hook: Option<PersistenceHook>,
-    context_transform: Option<ContextTransformHook>,
+    persistence_hook: Option<PersistenceHook<S>>,
+    context_transform: Option<ContextTransformHook<S>>,
 }
 
-impl<M, P> AgentLoop<M, P>
+impl<M, P> AgentLoop<M, P, ()>
 where
     M: CompletionModel,
     P: PromptHook<M>,
@@ -63,13 +65,51 @@ where
     pub fn new(agent: Agent<M, P>) -> Self {
         Self {
             agent: Arc::new(agent),
+            app_state: Arc::new(()),
             max_turns: 100,
             initial_history: Vec::new(),
             persistence_hook: None,
             context_transform: None,
         }
     }
+}
 
+impl<M, P> AgentLoop<M, P, ()>
+where
+    M: CompletionModel,
+    P: PromptHook<M>,
+{
+    /// Attach caller-owned state that stateful hooks can use without capture boilerplate.
+    pub fn with_app_state<S>(self, app_state: S) -> AgentLoop<M, P, S>
+    where
+        S: Send + Sync + 'static,
+    {
+        let persistence_hook = self.persistence_hook.map(|hook| {
+            Arc::new(move |_state: Arc<S>, messages| hook(Arc::new(()), messages))
+                as PersistenceHook<S>
+        });
+        let context_transform = self.context_transform.map(|transform| {
+            Arc::new(move |_state: Arc<S>, messages| transform(Arc::new(()), messages))
+                as ContextTransformHook<S>
+        });
+
+        AgentLoop {
+            agent: self.agent,
+            app_state: Arc::new(app_state),
+            max_turns: self.max_turns,
+            initial_history: self.initial_history,
+            persistence_hook,
+            context_transform,
+        }
+    }
+}
+
+impl<M, P, S> AgentLoop<M, P, S>
+where
+    M: CompletionModel,
+    P: PromptHook<M>,
+    S: Send + Sync + 'static,
+{
     pub fn max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = max_turns;
         self
@@ -87,17 +127,17 @@ where
 
     /// Persist committed messages at the end of each turn before the loop advances.
     ///
-    /// The hook receives only the messages that should be appended. For interrupted
-    /// turns this is limited to completed tool-call roundtrips; if nothing was
-    /// committed, the hook is not called.
+    /// The hook receives app state and only the messages that should be appended.
+    /// For interrupted turns this is limited to completed tool-call roundtrips;
+    /// if nothing was committed, the hook is not called.
     pub fn with_persistence_hook<F, Fut, E>(mut self, hook: F) -> Self
     where
-        F: Fn(Vec<Message>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<S>, Vec<Message>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), E>> + Send + 'static,
         E: Error + Send + Sync + 'static,
     {
-        self.persistence_hook = Some(Arc::new(move |messages| {
-            let future = hook(messages);
+        self.persistence_hook = Some(Arc::new(move |state, messages| {
+            let future = hook(state, messages);
             Box::pin(async move { future.await.map_err(|err| Box::new(err) as PersistError) })
         }));
         self
@@ -106,16 +146,16 @@ where
     /// Transform the active in-memory history at a turn boundary.
     ///
     /// The hook runs after any prior turn messages have been committed and before
-    /// the next Rig request is built. It receives the current active history and
-    /// returns the history that should be used going forward.
+    /// the next Rig request is built. It receives app state and the current active
+    /// history, and returns the history that should be used going forward.
     pub fn with_context_transform<F, Fut, E>(mut self, transform: F) -> Self
     where
-        F: Fn(Vec<Message>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<S>, Vec<Message>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<Message>, E>> + Send + 'static,
         E: Error + Send + Sync + 'static,
     {
-        self.context_transform = Some(Arc::new(move |messages| {
-            let future = transform(messages);
+        self.context_transform = Some(Arc::new(move |state, messages| {
+            let future = transform(state, messages);
             Box::pin(async move {
                 future
                     .await
@@ -126,11 +166,12 @@ where
     }
 }
 
-impl<M, P> AgentLoop<M, P>
+impl<M, P, S> AgentLoop<M, P, S>
 where
     M: CompletionModel + Send + Sync + 'static,
     M::StreamingResponse: Clone + Unpin + GetTokenUsage + WasmCompatSend + 'static,
     P: PromptHook<M> + Send + Sync + 'static,
+    S: Send + Sync + 'static,
 {
     /// Start the loop with an initial user prompt and return a control handle.
     pub fn prompt(&self, prompt: impl Into<Message>) -> AgentLoopHandle<M::StreamingResponse> {
@@ -139,6 +180,7 @@ where
         let state = Arc::new(Mutex::new(self.initial_history.clone()));
         let runner = Runner::new(
             self.agent.clone(),
+            self.app_state.clone(),
             self.max_turns,
             self.persistence_hook.clone(),
             self.context_transform.clone(),
@@ -380,15 +422,16 @@ enum Command {
     Abort,
 }
 
-struct Runner<M, P>
+struct Runner<M, P, S>
 where
     M: CompletionModel,
     P: PromptHook<M>,
 {
     agent: Arc<Agent<M, P>>,
+    app_state: Arc<S>,
     max_turns: usize,
-    persistence_hook: Option<PersistenceHook>,
-    context_transform: Option<ContextTransformHook>,
+    persistence_hook: Option<PersistenceHook<S>>,
+    context_transform: Option<ContextTransformHook<S>>,
     events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
     state: SharedMessages,
     immediate: VecDeque<Message>,
@@ -397,22 +440,24 @@ where
     last_response: Option<String>,
 }
 
-impl<M, P> Runner<M, P>
+impl<M, P, S> Runner<M, P, S>
 where
     M: CompletionModel,
     P: PromptHook<M>,
 {
     fn new(
         agent: Arc<Agent<M, P>>,
+        app_state: Arc<S>,
         max_turns: usize,
-        persistence_hook: Option<PersistenceHook>,
-        context_transform: Option<ContextTransformHook>,
+        persistence_hook: Option<PersistenceHook<S>>,
+        context_transform: Option<ContextTransformHook<S>>,
         events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
         state: SharedMessages,
         prompt: Message,
     ) -> Self {
         Self {
             agent,
+            app_state,
             max_turns,
             persistence_hook,
             context_transform,
@@ -510,11 +555,12 @@ impl PendingTurn {
     }
 }
 
-impl<M, P> Runner<M, P>
+impl<M, P, S> Runner<M, P, S>
 where
     M: CompletionModel + Send + Sync + 'static,
     M::StreamingResponse: Clone + Unpin + GetTokenUsage + WasmCompatSend + 'static,
     P: PromptHook<M> + Send + Sync + 'static,
+    S: Send + Sync + 'static,
 {
     async fn run(
         mut self,
@@ -555,7 +601,7 @@ where
         };
 
         let before = self.history_snapshot();
-        let after = transform(before.clone())
+        let after = transform(self.app_state.clone(), before.clone())
             .await
             .map_err(AgentLoopError::ContextTransform)?;
 
@@ -673,7 +719,7 @@ where
         }
 
         if let Some(hook) = &self.persistence_hook {
-            hook(messages.clone())
+            hook(self.app_state.clone(), messages.clone())
                 .await
                 .map_err(AgentLoopError::Persist)?;
             self.emit(AgentLoopEvent::Persisted {
@@ -1018,7 +1064,7 @@ mod tests {
             ],
         ]);
         let agent = AgentBuilder::new(model.clone()).build();
-        let agent_loop = AgentLoop::new(agent).with_context_transform(|messages| async move {
+        let agent_loop = AgentLoop::new(agent).with_context_transform(|_, messages| async move {
             if messages.len() >= 2 {
                 Ok::<_, std::io::Error>(vec![Message::user("summary")])
             } else {
@@ -1059,7 +1105,7 @@ mod tests {
             MockStreamEvent::final_response_with_default_usage(),
         ]]);
         let agent = AgentBuilder::new(model).build();
-        let agent_loop = AgentLoop::new(agent).with_context_transform(|_messages| async {
+        let agent_loop = AgentLoop::new(agent).with_context_transform(|_, _messages| async {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "compact failed",
@@ -1208,7 +1254,7 @@ mod tests {
         let agent = AgentBuilder::new(model).build();
         let persisted = Arc::new(Mutex::new(Vec::<Vec<Message>>::new()));
         let seen = persisted.clone();
-        let agent_loop = AgentLoop::new(agent).with_persistence_hook(move |messages| {
+        let agent_loop = AgentLoop::new(agent).with_persistence_hook(move |_, messages| {
             let seen = seen.clone();
             async move {
                 seen.lock().unwrap().push(messages);
@@ -1236,7 +1282,7 @@ mod tests {
             MockStreamEvent::final_response_with_default_usage(),
         ]]);
         let agent = AgentBuilder::new(model).build();
-        let agent_loop = AgentLoop::new(agent).with_persistence_hook(|_messages| async {
+        let agent_loop = AgentLoop::new(agent).with_persistence_hook(|_, _messages| async {
             Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
         });
 
