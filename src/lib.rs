@@ -4,7 +4,7 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use futures::StreamExt;
@@ -17,7 +17,10 @@ use rig::{
     wasm_compat::WasmCompatSend,
 };
 use tokio::{
-    sync::mpsc::{self, error::TryRecvError},
+    sync::{
+        broadcast,
+        mpsc::{self, error::TryRecvError},
+    },
     task::JoinHandle,
 };
 
@@ -25,6 +28,15 @@ pub type PersistError = Box<dyn Error + Send + Sync + 'static>;
 
 type PersistenceFuture = Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send>>;
 type PersistenceHook = Arc<dyn Fn(Vec<Message>) -> PersistenceFuture + Send + Sync>;
+type SharedMessages = Arc<Mutex<Vec<Message>>>;
+const EVENT_BUFFER_SIZE: usize = 1024;
+
+fn lock_messages(messages: &SharedMessages) -> MutexGuard<'_, Vec<Message>> {
+    match messages.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 /// A small harness around `rig::agent::Agent` that owns the queue between prompts.
 pub struct AgentLoop<M, P = ()>
@@ -81,27 +93,54 @@ where
     P: PromptHook<M> + Send + Sync + 'static,
 {
     /// Start the loop with an initial user prompt and return a control handle.
-    pub fn prompt(&self, prompt: impl Into<Message>) -> AgentLoopHandle {
+    pub fn prompt(&self, prompt: impl Into<Message>) -> AgentLoopHandle<M::StreamingResponse> {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let (events_tx, _) = broadcast::channel(EVENT_BUFFER_SIZE);
+        let state = Arc::new(Mutex::new(Vec::new()));
         let runner = Runner::new(
             self.agent.clone(),
             self.max_turns,
             self.persistence_hook.clone(),
+            events_tx.clone(),
+            state.clone(),
             prompt.into(),
         );
         let task = tokio::spawn(async move { runner.run(commands_rx).await });
 
-        AgentLoopHandle { commands_tx, task }
+        AgentLoopHandle {
+            commands_tx,
+            events_tx,
+            state,
+            task,
+        }
     }
 }
 
 /// A running agent loop.
-pub struct AgentLoopHandle {
+pub struct AgentLoopHandle<R>
+where
+    R: Clone,
+{
     commands_tx: mpsc::UnboundedSender<Command>,
+    events_tx: broadcast::Sender<AgentLoopEvent<R>>,
+    state: SharedMessages,
     task: JoinHandle<Result<AgentLoopResult, AgentLoopError>>,
 }
 
-impl AgentLoopHandle {
+impl<R> AgentLoopHandle<R>
+where
+    R: Clone,
+{
+    /// Subscribe to harness lifecycle events and raw Rig stream items.
+    pub fn subscribe(&self) -> broadcast::Receiver<AgentLoopEvent<R>> {
+        self.events_tx.subscribe()
+    }
+
+    /// Return a clone of the committed in-memory message history.
+    pub fn state(&self) -> Vec<Message> {
+        lock_messages(&self.state).clone()
+    }
+
     /// Wait for the loop to become idle, abort, or error.
     pub async fn wait(self) -> Result<AgentLoopResult, AgentLoopError> {
         match self.task.await {
@@ -112,28 +151,55 @@ impl AgentLoopHandle {
 
     /// Queue a message to run before follow-ups after the current prompt settles.
     pub fn steer(&self, message: impl Into<Message>) -> Result<(), AgentLoopError> {
-        self.send(Command::Steer(message.into()))
+        let message = message.into();
+        self.send(Command::Steer(message.clone()))?;
+        self.emit(AgentLoopEvent::Queued {
+            kind: QueueKind::Steer,
+            message: Some(message),
+        });
+        Ok(())
     }
 
     /// Queue a message to run after the current prompt would otherwise leave the loop idle.
     pub fn follow_up(&self, message: impl Into<Message>) -> Result<(), AgentLoopError> {
-        self.send(Command::FollowUp(message.into()))
+        let message = message.into();
+        self.send(Command::FollowUp(message.clone()))?;
+        self.emit(AgentLoopEvent::Queued {
+            kind: QueueKind::FollowUp,
+            message: Some(message),
+        });
+        Ok(())
     }
 
     /// Stop the current prompt, keep committed tool results, then run this message next.
     pub fn interrupt(&self, message: impl Into<Message>) -> Result<(), AgentLoopError> {
-        self.send(Command::Interrupt(message.into()))
+        let message = message.into();
+        self.send(Command::Interrupt(message.clone()))?;
+        self.emit(AgentLoopEvent::Queued {
+            kind: QueueKind::Interrupt,
+            message: Some(message),
+        });
+        Ok(())
     }
 
     /// Stop the loop. Completed tool results from the current prompt are kept.
     pub fn abort(&self) -> Result<(), AgentLoopError> {
-        self.send(Command::Abort)
+        self.send(Command::Abort)?;
+        self.emit(AgentLoopEvent::Queued {
+            kind: QueueKind::Abort,
+            message: None,
+        });
+        Ok(())
     }
 
     fn send(&self, command: Command) -> Result<(), AgentLoopError> {
         self.commands_tx
             .send(command)
             .map_err(|_| AgentLoopError::CommandChannelClosed)
+    }
+
+    fn emit(&self, event: AgentLoopEvent<R>) {
+        let _ = self.events_tx.send(event);
     }
 }
 
@@ -150,6 +216,43 @@ pub struct AgentLoopResult {
     pub end_reason: EndReason,
     pub history: Vec<Message>,
     pub last_response: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueueKind {
+    Steer,
+    FollowUp,
+    Interrupt,
+    Abort,
+}
+
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum AgentLoopEvent<R> {
+    LoopStarted,
+    Queued {
+        kind: QueueKind,
+        message: Option<Message>,
+    },
+    TurnStarted {
+        prompt: Message,
+    },
+    Rig(MultiTurnStreamItem<R>),
+    TurnCommitted {
+        messages: Vec<Message>,
+    },
+    TurnInterrupted {
+        messages: Vec<Message>,
+    },
+    TurnAborted {
+        messages: Vec<Message>,
+    },
+    Persisted {
+        messages: Vec<Message>,
+    },
+    LoopEnded {
+        end_reason: EndReason,
+    },
 }
 
 #[derive(Debug)]
@@ -203,10 +306,11 @@ where
     agent: Arc<Agent<M, P>>,
     max_turns: usize,
     persistence_hook: Option<PersistenceHook>,
+    events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
+    state: SharedMessages,
     immediate: VecDeque<Message>,
     steering: VecDeque<Message>,
     follow_ups: VecDeque<Message>,
-    history: Vec<Message>,
     last_response: Option<String>,
 }
 
@@ -219,25 +323,20 @@ where
         agent: Arc<Agent<M, P>>,
         max_turns: usize,
         persistence_hook: Option<PersistenceHook>,
+        events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
+        state: SharedMessages,
         prompt: Message,
     ) -> Self {
         Self {
             agent,
             max_turns,
             persistence_hook,
+            events_tx,
+            state,
             immediate: VecDeque::from([prompt]),
             steering: VecDeque::new(),
             follow_ups: VecDeque::new(),
-            history: Vec::new(),
             last_response: None,
-        }
-    }
-
-    fn finish(self, end_reason: EndReason) -> AgentLoopResult {
-        AgentLoopResult {
-            end_reason,
-            history: self.history,
-            last_response: self.last_response,
         }
     }
 
@@ -288,6 +387,8 @@ where
         mut self,
         mut commands_rx: mpsc::UnboundedReceiver<Command>,
     ) -> Result<AgentLoopResult, AgentLoopError> {
+        self.emit(AgentLoopEvent::LoopStarted);
+
         loop {
             if self.drain_ready_commands(&mut commands_rx) == CommandAction::Abort {
                 return Ok(self.finish(EndReason::Aborted));
@@ -309,7 +410,11 @@ where
         prompt: Message,
         commands_rx: &mut mpsc::UnboundedReceiver<Command>,
     ) -> Result<PromptAction, AgentLoopError> {
-        let base_history = self.history.clone();
+        self.emit(AgentLoopEvent::TurnStarted {
+            prompt: prompt.clone(),
+        });
+
+        let base_history = self.history_snapshot();
         let mut partial_turn = PartialTurn::default();
         let mut commands_closed = false;
         let mut stream = self
@@ -331,16 +436,14 @@ where
                         Command::Steer(message) => self.steering.push_back(message),
                         Command::FollowUp(message) => self.follow_ups.push_back(message),
                         Command::Interrupt(message) => {
-                            if let Some(messages) = partial_turn.append_messages(&prompt) {
-                                self.commit_append(messages).await?;
-                            }
+                            let messages = partial_turn.append_messages(&prompt).unwrap_or_default();
+                            self.commit_append(messages, CommitEvent::TurnInterrupted).await?;
                             self.immediate.push_front(message);
                             return Ok(PromptAction::Continue);
                         }
                         Command::Abort => {
-                            if let Some(messages) = partial_turn.append_messages(&prompt) {
-                                self.commit_append(messages).await?;
-                            }
+                            let messages = partial_turn.append_messages(&prompt).unwrap_or_default();
+                            self.commit_append(messages, CommitEvent::TurnAborted).await?;
                             return Ok(PromptAction::Abort);
                         }
                     }
@@ -351,7 +454,10 @@ where
                     };
 
                     match item {
-                        Ok(item) => self.handle_stream_item(item, &mut partial_turn).await?,
+                        Ok(item) => {
+                            self.emit(AgentLoopEvent::Rig(item.clone()));
+                            self.handle_stream_item(item, &mut partial_turn).await?;
+                        }
                         Err(err) => {
                             if let Some(history) = history_from_error(&err) {
                                 self.commit_recovered_history(&base_history, history).await?;
@@ -377,7 +483,8 @@ where
             MultiTurnStreamItem::FinalResponse(final_response) => {
                 self.last_response = Some(final_response.response().to_string());
                 if let Some(messages) = final_response.history() {
-                    self.commit_append(messages.to_vec()).await?;
+                    self.commit_append(messages.to_vec(), CommitEvent::TurnCommitted)
+                        .await?;
                 }
             }
             MultiTurnStreamItem::CompletionCall(_) => {}
@@ -387,8 +494,13 @@ where
         Ok(())
     }
 
-    async fn commit_append(&mut self, messages: Vec<Message>) -> Result<(), AgentLoopError> {
+    async fn commit_append(
+        &mut self,
+        messages: Vec<Message>,
+        event: CommitEvent,
+    ) -> Result<(), AgentLoopError> {
         if messages.is_empty() {
+            self.emit(event.into_agent_event(messages));
             return Ok(());
         }
 
@@ -396,9 +508,13 @@ where
             hook(messages.clone())
                 .await
                 .map_err(AgentLoopError::Persist)?;
+            self.emit(AgentLoopEvent::Persisted {
+                messages: messages.clone(),
+            });
         }
 
-        self.history.extend(messages);
+        lock_messages(&self.state).extend(messages.clone());
+        self.emit(event.into_agent_event(messages));
         Ok(())
     }
 
@@ -408,12 +524,49 @@ where
         recovered_history: Vec<Message>,
     ) -> Result<(), AgentLoopError> {
         if recovered_history.len() < base_history.len() {
-            self.history = recovered_history;
+            *lock_messages(&self.state) = recovered_history;
             return Ok(());
         }
 
         let append = recovered_history[base_history.len()..].to_vec();
-        self.commit_append(append).await
+        self.commit_append(append, CommitEvent::TurnCommitted).await
+    }
+
+    fn finish(self, end_reason: EndReason) -> AgentLoopResult {
+        self.emit(AgentLoopEvent::LoopEnded {
+            end_reason: end_reason.clone(),
+        });
+
+        AgentLoopResult {
+            end_reason,
+            history: self.history_snapshot(),
+            last_response: self.last_response,
+        }
+    }
+
+    fn emit(&self, event: AgentLoopEvent<M::StreamingResponse>) {
+        let _ = self.events_tx.send(event);
+    }
+
+    fn history_snapshot(&self) -> Vec<Message> {
+        lock_messages(&self.state).clone()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitEvent {
+    TurnCommitted,
+    TurnInterrupted,
+    TurnAborted,
+}
+
+impl CommitEvent {
+    fn into_agent_event<R>(self, messages: Vec<Message>) -> AgentLoopEvent<R> {
+        match self {
+            Self::TurnCommitted => AgentLoopEvent::TurnCommitted { messages },
+            Self::TurnInterrupted => AgentLoopEvent::TurnInterrupted { messages },
+            Self::TurnAborted => AgentLoopEvent::TurnAborted { messages },
+        }
     }
 }
 
@@ -520,7 +673,8 @@ mod tests {
     use rig::{
         agent::AgentBuilder,
         message::UserContent,
-        test_utils::{MockCompletionModel, MockStreamEvent},
+        streaming::{StreamedAssistantContent, ToolCallDeltaContent},
+        test_utils::{MockAddTool, MockCompletionModel, MockStreamEvent},
     };
     use std::sync::{Arc, Mutex};
 
@@ -647,6 +801,120 @@ mod tests {
         assert!(matches!(err, AgentLoopError::Persist(_)));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_forwards_rig_stream_items_with_tool_deltas() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::tool_call_name_delta("call_1", "internal_1", "add"),
+            MockStreamEvent::tool_call_arguments_delta("call_1", "internal_1", r#"{"x":1,"y":2}"#),
+            MockStreamEvent::text("done"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model).tool(MockAddTool).build();
+        let agent_loop = AgentLoop::new(agent);
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
+
+        let result = handle.wait().await.unwrap();
+
+        assert_eq!(result.end_reason, EndReason::Idle);
+        let events = drain_events(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentLoopEvent::Rig(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ToolCallDelta {
+                        content: ToolCallDeltaContent::Name(name),
+                        ..
+                    }
+                )) if name == "add"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentLoopEvent::Rig(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ToolCallDelta {
+                        content: ToolCallDeltaContent::Delta(arguments),
+                        ..
+                    }
+                )) if arguments == r#"{"x":1,"y":2}"#
+            )
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_emits_queue_and_lifecycle_events() {
+        let model = MockCompletionModel::from_stream_turns([
+            [
+                MockStreamEvent::text("first"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            [
+                MockStreamEvent::text("follow"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model).build();
+        let agent_loop = AgentLoop::new(agent);
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
+
+        handle.follow_up(Message::user("follow-up")).unwrap();
+        let result = handle.wait().await.unwrap();
+
+        assert_eq!(result.end_reason, EndReason::Idle);
+        let events = drain_events(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentLoopEvent::Queued {
+                    kind: QueueKind::FollowUp,
+                    ..
+                }
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentLoopEvent::TurnCommitted { messages } if !messages.is_empty())
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentLoopEvent::LoopEnded {
+                    end_reason: EndReason::Idle
+                }
+            )
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_state_returns_committed_messages_while_running() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("first"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+        let agent_loop = AgentLoop::new(agent);
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
+
+        loop {
+            match events.recv().await.unwrap() {
+                AgentLoopEvent::TurnCommitted { messages } => {
+                    assert_eq!(messages.len(), 2);
+                    let state = handle.state();
+                    assert_eq!(state.len(), 2);
+                    assert_eq!(first_user_text(&state[0]).as_deref(), Some("start"));
+                    break;
+                }
+                AgentLoopEvent::LoopEnded { .. } => panic!("loop ended before commit event"),
+                _ => {}
+            }
+        }
+
+        let result = handle.wait().await.unwrap();
+        assert_eq!(result.history.len(), 2);
+    }
+
     #[test]
     fn partial_turn_commits_completed_tool_results() {
         let mut partial = PartialTurn::default();
@@ -706,5 +974,15 @@ mod tests {
             UserContent::Text(text) => Some(text.text.clone()),
             _ => None,
         })
+    }
+
+    fn drain_events<R: Clone>(
+        events: &mut broadcast::Receiver<AgentLoopEvent<R>>,
+    ) -> Vec<AgentLoopEvent<R>> {
+        let mut drained = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            drained.push(event);
+        }
+        drained
     }
 }
