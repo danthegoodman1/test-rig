@@ -1,1 +1,174 @@
-# test-rig
+# rigloop
+
+A small agent loop harness for [Rig](https://github.com/0xPlaygrounds/rig).
+
+`rigloop` owns the queue around a `rig::agent::Agent`: prompt once, then
+steer, follow up, interrupt, resume, inspect state, or abort from a handle.
+It keeps Rig in charge of model calls and tools, and adds just enough loop
+control for application code.
+
+## Contents
+
+- [Install](#install)
+- [Quick Start](#quick-start)
+- [Handle Controls](#handle-controls)
+- [Turn Hooks](#turn-hooks)
+- [Events](#events)
+- [History and Resume](#history-and-resume)
+- [End Reasons](#end-reasons)
+- [Inspiration](#inspiration)
+
+## Install
+
+```toml
+[dependencies]
+rigloop = "0.1"
+rig = "0.38"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+## Quick Start
+
+```rust
+use rig::{
+    client::CompletionClient,
+    message::Message,
+    providers::openai,
+};
+use rigloop::AgentLoop;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = openai::Client::from_env()?;
+    let agent = client
+        .agent(openai::GPT_5_5)
+        .preamble("You are concise and practical.")
+        .build();
+
+    let handle = AgentLoop::new(agent).prompt(Message::user("Explain agent loops in one paragraph."));
+
+    let result = handle.wait().await?;
+    println!("end_reason: {:?}", result.end_reason);
+    println!("{}", result.last_response.unwrap_or_default());
+
+    Ok(())
+}
+```
+
+## Handle Controls
+
+`AgentLoop::prompt(...)` returns an `AgentLoopHandle`.
+
+```rust
+handle.follow_up(Message::user("Also give me a checklist."))?;
+handle.steer(Message::user("Keep the next answer shorter."))?;
+handle.interrupt(Message::user("Stop that and answer this instead."))?;
+handle.resume()?;
+handle.abort()?;
+
+let messages = handle.state();
+let result = handle.wait().await?;
+```
+
+The queue rules are intentionally simple:
+
+| Method | Behavior |
+| --- | --- |
+| `follow_up` | Runs after the loop would otherwise become idle. Follow-ups apply one at a time. |
+| `steer` | Runs after the current agent turn. All ready steers apply together. |
+| `interrupt` | Stops the current turn, keeps only valid completed tool results, then runs the new message next. |
+| `resume` | Runs another agent turn using the current history as-is. It is a no-op while a turn is running. |
+| `abort` | Stops the loop. Completed tool results from the current turn are kept. |
+| `state` | Returns a clone of the committed in-memory Rig message history. |
+| `wait` | Waits for the loop to finish and returns `AgentLoopResult`. |
+
+## Turn Hooks
+
+Use `with_turn_hook` for persistence, compaction, and application-controlled
+stops. The hook receives:
+
+- `history`: the candidate full history after appending this turn's messages.
+- `new_messages`: only the append batch generated at this turn boundary.
+
+```rust
+use rigloop::{AgentLoop, TurnHookAction};
+
+let agent_loop = AgentLoop::new(agent).with_turn_hook(|_app_state, turn| async move {
+    println!("persist {} new messages", turn.new_messages.len());
+
+    if turn.history.len() > 100 {
+        let summary = rig::message::Message::system("Compacted summary of the previous turns.");
+        return Ok::<_, std::convert::Infallible>(TurnHookAction::ReplaceHistory(vec![summary]));
+    }
+
+    Ok(TurnHookAction::Continue)
+});
+```
+
+A hook can return:
+
+| Action | Meaning |
+| --- | --- |
+| `Continue` | Keep the candidate full history. |
+| `ReplaceHistory(messages)` | Replace the in-memory history with this complete history. |
+| `Abort { reason }` | Keep the candidate full history, then stop the loop with `EndReason::AbortedByHook`. |
+
+## Events
+
+Subscribe to lifecycle events and raw Rig stream items:
+
+```rust
+let mut events = handle.subscribe();
+
+while let Ok(event) = events.recv().await {
+    match event {
+        rigloop::AgentLoopEvent::Rig(item) => {
+            // Full Rig stream granularity, including text deltas and tool deltas.
+        }
+        rigloop::AgentLoopEvent::TurnCommitted { messages } => {
+            // A valid append batch was committed.
+        }
+        rigloop::AgentLoopEvent::LoopEnded { end_reason } => break,
+        _ => {}
+    }
+}
+```
+
+## History and Resume
+
+Seed history with `with_history(...)`:
+
+```rust
+let loop_from_history = AgentLoop::new(agent)
+    .with_history(existing_messages)
+    .resume()?;
+```
+
+`resume()` validates that the committed Rig message history is usable before
+starting another model call. Invalid tool-call ordering is rejected before it
+can be sent to a provider.
+
+## End Reasons
+
+`AgentLoopResult` includes `end_reason`, `history`, and `last_response`.
+
+Known end reasons include:
+
+| Reason | Meaning |
+| --- | --- |
+| `Idle` | The prompt and all queued work completed. |
+| `Aborted` | The caller aborted the loop. |
+| `AbortedByHook` | A turn hook stopped the loop. |
+| `ContentFilter` | The provider refused or filtered the request/response. |
+| `ContextFull` | The provider rejected the request because the context was too large. |
+| `Length` | The provider stopped due to an output limit. |
+| `MaxTurns` | Rig hit the configured multi-turn tool-call limit. |
+| `ToolError` | Tool execution failed. |
+| `ApiError` | The provider/client returned an API error. |
+
+## Inspiration
+
+The API shape is inspired by
+[`@earendil-works/pi-agent-core`](https://github.com/earendil-works/pi/tree/main/packages/agent):
+stateful agent control, event streaming, steering, follow-ups, and hooks. This
+crate keeps that idea intentionally small and Rig-native.

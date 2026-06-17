@@ -5,7 +5,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use agentloop::{AgentLoop, TurnHookAction};
 use rig::{
     agent::AgentBuilder,
     completion::ToolDefinition,
@@ -13,6 +12,7 @@ use rig::{
     test_utils::{MockCompletionModel, MockStreamEvent},
     tool::Tool,
 };
+use rigloop::{AgentLoop, TurnHookAction};
 use serde_json::{Value, json};
 
 type AgentId = String;
@@ -145,9 +145,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let summary = vec![Message::system(format!(
-                "Compacted summary: previous generation contained {} messages. \
-                     The user asked to start with an echo tool call; the tool returned \
-                     a draft input result; the agent completed that turn.",
+                "Compacted summary: previous generation contained {} messages.",
                 turn.history.len()
             ))];
 
@@ -170,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
 
             Ok(TurnHookAction::ReplaceHistory(summary))
         });
+
     let handle = agent_loop.prompt(Message::user(
         "Start by calling the echo tool with a draft input.",
     ));

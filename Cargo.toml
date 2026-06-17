@@ -1,11 +1,21 @@
 [package]
-name = "agentloop"
+name = "rigloop"
 version = "0.1.0"
 edition = "2024"
+description = "A small agent loop harness for Rig."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/danthegoodman1/test-rig"
+readme = "README.md"
+keywords = ["rig", "agent", "llm", "async"]
+categories = ["asynchronous"]
 
 [dependencies]
-anyhow = "1.0.102"
 futures = "0.3.32"
+rig = "0.38.2"
+tokio = { version = "1.52.3", features = ["macros", "rt", "sync"] }
+
+[dev-dependencies]
+anyhow = "1.0.102"
 rig = { version = "0.38.2", features = ["test-utils"] }
 serde_json = "1.0.150"
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time"] }
