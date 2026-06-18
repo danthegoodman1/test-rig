@@ -37,13 +37,33 @@ struct MemoryStore {
 }
 
 impl MemoryStore {
-    fn append(&mut self, agent_id: &str, generation_id: u64, messages: Vec<Message>) -> usize {
+    fn append_at(
+        &mut self,
+        agent_id: &str,
+        generation_id: u64,
+        start_index: usize,
+        messages: &[Message],
+    ) -> usize {
         let session = self
             .sessions
             .entry((agent_id.to_string(), generation_id))
             .or_default();
-        let start_index = session.len();
-        session.extend(messages);
+        assert!(
+            start_index <= session.len(),
+            "persist cursor cannot skip message positions"
+        );
+
+        for (offset, message) in messages.iter().enumerate() {
+            let index = start_index + offset;
+            if index < session.len() {
+                if session[index] == *message {
+                    continue;
+                }
+                session.truncate(index);
+            }
+            session.push(message.clone());
+        }
+
         start_index
     }
 
@@ -56,6 +76,34 @@ impl MemoryStore {
             );
         }
     }
+}
+
+fn persist_append(state: &DemoState, history: &[Message], new_messages: &[Message], label: &str) {
+    if new_messages.is_empty() {
+        return;
+    }
+
+    let start_index = history.len() - new_messages.len();
+    let mut cursor = state.cursor.lock().unwrap();
+    let mut store = state.store.lock().unwrap();
+    let append_index = store.append_at(
+        &cursor.agent_id,
+        cursor.generation_id,
+        start_index,
+        new_messages,
+    );
+
+    println!(
+        "{label}> agent={} generation={} append index={} count={}",
+        cursor.agent_id,
+        cursor.generation_id,
+        append_index,
+        new_messages.len()
+    );
+
+    cursor.next_message_index = cursor
+        .next_message_index
+        .max(start_index + new_messages.len());
 }
 
 struct EchoTool;
@@ -122,26 +170,12 @@ async fn main() -> anyhow::Result<()> {
         .turn_timeout(Duration::from_secs(30))
         .loop_timeout(Duration::from_secs(120))
         .with_app_state(app_state)
+        .on_assistant_message_finished(|state, context| async move {
+            persist_append(&state, &context.history, &context.new_messages, "assistant");
+            Ok::<_, std::convert::Infallible>(())
+        })
         .with_turn_hook(|state, turn| async move {
-            if !turn.new_messages.is_empty() {
-                let mut cursor = state.cursor.lock().unwrap();
-                let mut store = state.store.lock().unwrap();
-                let start_index = store.append(
-                    &cursor.agent_id,
-                    cursor.generation_id,
-                    turn.new_messages.clone(),
-                );
-
-                println!(
-                    "persist> agent={} generation={} append index={} count={}",
-                    cursor.agent_id,
-                    cursor.generation_id,
-                    start_index,
-                    turn.new_messages.len()
-                );
-
-                cursor.next_message_index = start_index + turn.new_messages.len();
-            }
+            persist_append(&state, &turn.history, &turn.new_messages, "persist");
 
             if turn.history.len() < 4 {
                 return Ok::<_, std::convert::Infallible>(TurnHookAction::Continue);
@@ -155,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
             let mut cursor = state.cursor.lock().unwrap();
             let mut store = state.store.lock().unwrap();
             let next_generation_id = cursor.generation_id + 1;
-            let start_index = store.append(&cursor.agent_id, next_generation_id, summary.clone());
+            let start_index = store.append_at(&cursor.agent_id, next_generation_id, 0, &summary);
 
             println!(
                 "compact> agent={} generation {} -> {} summary index={} count={}",

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     error::Error,
     fmt,
     future::{Future, IntoFuture},
@@ -16,7 +16,7 @@ use rig::{
     OneOrMany,
     agent::{Agent, MultiTurnStreamItem, PromptHook, StreamingError},
     completion::{CompletionError, CompletionModel, GetTokenUsage, PromptError},
-    message::{AssistantContent, Message, ToolCall, UserContent},
+    message::{AssistantContent, Message, ToolCall, ToolResult, ToolResultContent, UserContent},
     streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt},
     wasm_compat::WasmCompatSend,
 };
@@ -30,12 +30,18 @@ use tokio::{
 };
 
 pub type TurnHookError = Box<dyn Error + Send + Sync + 'static>;
+pub type AssistantMessageHookError = Box<dyn Error + Send + Sync + 'static>;
 
 type TurnHookFuture = Pin<Box<dyn Future<Output = Result<TurnHookAction, TurnHookError>> + Send>>;
 type TurnHook<S> = Arc<dyn Fn(Arc<S>, TurnHookContext) -> TurnHookFuture + Send + Sync>;
+type AssistantMessageHookFuture =
+    Pin<Box<dyn Future<Output = Result<(), AssistantMessageHookError>> + Send>>;
+type AssistantMessageHook<S> =
+    Arc<dyn Fn(Arc<S>, AssistantMessageContext) -> AssistantMessageHookFuture + Send + Sync>;
 type SharedMessages = Arc<Mutex<Vec<Message>>>;
 type SharedTurnRunning = Arc<AtomicBool>;
 const EVENT_BUFFER_SIZE: usize = 1024;
+const DEFAULT_TOOL_CRASH_MESSAGE: &str = "tool crashed before a result returned";
 
 fn lock_messages(messages: &SharedMessages) -> MutexGuard<'_, Vec<Message>> {
     match messages.lock() {
@@ -57,6 +63,8 @@ where
     loop_timeout: Option<Duration>,
     initial_history: Vec<Message>,
     turn_hook: Option<TurnHook<S>>,
+    assistant_message_hook: Option<AssistantMessageHook<S>>,
+    unanswered_tool_call_repair: Option<String>,
 }
 
 impl<M, P> AgentLoop<M, P, ()>
@@ -73,6 +81,8 @@ where
             loop_timeout: None,
             initial_history: Vec::new(),
             turn_hook: None,
+            assistant_message_hook: None,
+            unanswered_tool_call_repair: Some(DEFAULT_TOOL_CRASH_MESSAGE.to_string()),
         }
     }
 }
@@ -90,6 +100,10 @@ where
         let turn_hook = self.turn_hook.map(|hook| {
             Arc::new(move |_state: Arc<S>, turn| hook(Arc::new(()), turn)) as TurnHook<S>
         });
+        let assistant_message_hook = self.assistant_message_hook.map(|hook| {
+            Arc::new(move |_state: Arc<S>, context| hook(Arc::new(()), context))
+                as AssistantMessageHook<S>
+        });
 
         AgentLoop {
             agent: self.agent,
@@ -99,6 +113,8 @@ where
             loop_timeout: self.loop_timeout,
             initial_history: self.initial_history,
             turn_hook,
+            assistant_message_hook,
+            unanswered_tool_call_repair: self.unanswered_tool_call_repair,
         }
     }
 }
@@ -136,6 +152,35 @@ where
         self
     }
 
+    /// Override the synthetic tool-result text used when repairing persisted
+    /// assistant tool calls that do not have matching tool results.
+    pub fn with_unanswered_tool_call_repair_message(mut self, message: impl Into<String>) -> Self {
+        self.unanswered_tool_call_repair = Some(message.into());
+        self
+    }
+
+    /// Observe each completed assistant message before it is part of a valid turn commit.
+    ///
+    /// When the assistant message contains tool calls, `context.new_messages`
+    /// is not provider-valid until matching user tool results are appended or
+    /// recovered by the default unanswered-tool-call history repair.
+    pub fn on_assistant_message_finished<F, Fut, E>(mut self, hook: F) -> Self
+    where
+        F: Fn(Arc<S>, AssistantMessageContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        E: Error + Send + Sync + 'static,
+    {
+        self.assistant_message_hook = Some(Arc::new(move |state, context| {
+            let future = hook(state, context);
+            Box::pin(async move {
+                future
+                    .await
+                    .map_err(|err| Box::new(err) as AssistantMessageHookError)
+            })
+        }));
+        self
+    }
+
     /// Observe and optionally rewrite each turn commit.
     ///
     /// The hook receives `(app_state, turn)`. `turn.history` is the candidate
@@ -166,20 +211,35 @@ where
 {
     /// Start the loop with an initial user prompt and return a control handle.
     pub fn prompt(&self, prompt: impl Into<Message>) -> AgentLoopHandle<M::StreamingResponse> {
-        self.start(PendingTurn::single(prompt.into()))
+        self.start(
+            PendingTurn::single(prompt.into()),
+            self.repaired_initial_history(),
+        )
     }
 
     /// Start the loop from the seeded history without appending a new prompt.
     pub fn resume(&self) -> Result<AgentLoopHandle<M::StreamingResponse>, AgentLoopError> {
-        validate_resume_history(&self.initial_history)
-            .map_err(AgentLoopError::InvalidMessageHistory)?;
-        Ok(self.start(PendingTurn::Resume))
+        let initial_history = self.repaired_initial_history();
+        validate_resume_history(&initial_history).map_err(AgentLoopError::InvalidMessageHistory)?;
+        Ok(self.start(PendingTurn::Resume, initial_history))
     }
 
-    fn start(&self, initial_turn: PendingTurn) -> AgentLoopHandle<M::StreamingResponse> {
+    fn repaired_initial_history(&self) -> Vec<Message> {
+        let history = self.initial_history.clone();
+        match &self.unanswered_tool_call_repair {
+            Some(message) => repair_unanswered_tool_calls(history, message),
+            None => history,
+        }
+    }
+
+    fn start(
+        &self,
+        initial_turn: PendingTurn,
+        initial_history: Vec<Message>,
+    ) -> AgentLoopHandle<M::StreamingResponse> {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let (events_tx, _) = broadcast::channel(EVENT_BUFFER_SIZE);
-        let state = Arc::new(Mutex::new(self.initial_history.clone()));
+        let state = Arc::new(Mutex::new(initial_history));
         let turn_running = Arc::new(AtomicBool::new(false));
         let runner = Runner::new(RunnerInit {
             agent: self.agent.clone(),
@@ -188,6 +248,7 @@ where
             turn_timeout: self.turn_timeout,
             loop_timeout: self.loop_timeout,
             turn_hook: self.turn_hook.clone(),
+            assistant_message_hook: self.assistant_message_hook.clone(),
             events_tx: events_tx.clone(),
             state: state.clone(),
             turn_running: turn_running.clone(),
@@ -413,6 +474,19 @@ pub struct TurnHookContext {
     pub new_messages: Vec<Message>,
 }
 
+#[derive(Clone, Debug)]
+pub struct AssistantMessageContext {
+    /// The assistant message that just finished streaming.
+    pub message: Message,
+    /// The candidate full history after appending `new_messages`.
+    ///
+    /// This history may be temporarily invalid for provider replay when the
+    /// assistant message contains tool calls without matching tool results.
+    pub history: Vec<Message>,
+    /// The ordered partial append batch ending with `message`.
+    pub new_messages: Vec<Message>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum TurnHookAction {
@@ -453,6 +527,10 @@ pub enum AgentLoopEvent<R> {
         prompt: Message,
     },
     Rig(MultiTurnStreamItem<R>),
+    AssistantMessageFinished {
+        message: Message,
+        messages: Vec<Message>,
+    },
     TurnCommitted {
         messages: Vec<Message>,
     },
@@ -488,6 +566,7 @@ pub enum AgentLoopError {
     CommandChannelClosed,
     InvalidMessageHistory(InvalidMessageHistoryError),
     TurnHook(TurnHookError),
+    AssistantMessageHook(AssistantMessageHookError),
     Rig(StreamingError),
     TaskJoin(tokio::task::JoinError),
 }
@@ -498,6 +577,7 @@ impl fmt::Display for AgentLoopError {
             Self::CommandChannelClosed => f.write_str("agent loop command channel is closed"),
             Self::InvalidMessageHistory(err) => write!(f, "{err}"),
             Self::TurnHook(err) => write!(f, "turn hook failed: {err}"),
+            Self::AssistantMessageHook(err) => write!(f, "assistant message hook failed: {err}"),
             Self::Rig(err) => write!(f, "{err}"),
             Self::TaskJoin(err) => write!(f, "{err}"),
         }
@@ -509,6 +589,7 @@ impl Error for AgentLoopError {
         match self {
             Self::InvalidMessageHistory(err) => Some(err),
             Self::TurnHook(err) => Some(err.as_ref()),
+            Self::AssistantMessageHook(err) => Some(err.as_ref()),
             Self::Rig(err) => Some(err),
             Self::TaskJoin(err) => Some(err),
             Self::CommandChannelClosed => None,
@@ -618,6 +699,51 @@ async fn wait_for_timeout(deadline: Option<TimeoutDeadline>) {
     }
 }
 
+async fn poll_assistant_message_hook(
+    hook: &mut Option<AssistantMessageHookTask>,
+) -> Result<(), AgentLoopError> {
+    match hook {
+        Some(hook) => match (&mut hook.handle).await {
+            Ok(result) => result,
+            Err(err) => Err(AgentLoopError::TaskJoin(err)),
+        },
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_for_assistant_message_hook(
+    hook: &mut Option<AssistantMessageHookTask>,
+) -> Result<(), AgentLoopError> {
+    if let Some(mut hook) = hook.take() {
+        match (&mut hook.handle).await {
+            Ok(result) => result?,
+            Err(err) => return Err(AgentLoopError::TaskJoin(err)),
+        }
+    }
+
+    Ok(())
+}
+
+struct AssistantMessageHookTask {
+    handle: JoinHandle<Result<(), AgentLoopError>>,
+}
+
+impl AssistantMessageHookTask {
+    fn spawn(hook: AssistantMessageHookFuture) -> Self {
+        Self {
+            handle: tokio::spawn(async move {
+                hook.await.map_err(AgentLoopError::AssistantMessageHook)
+            }),
+        }
+    }
+}
+
+impl Drop for AssistantMessageHookTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 struct Runner<M, P, S>
 where
     M: CompletionModel,
@@ -629,6 +755,7 @@ where
     turn_timeout: Option<Duration>,
     loop_timeout: Option<Duration>,
     turn_hook: Option<TurnHook<S>>,
+    assistant_message_hook: Option<AssistantMessageHook<S>>,
     events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
     state: SharedMessages,
     turn_running: SharedTurnRunning,
@@ -650,6 +777,7 @@ where
     turn_timeout: Option<Duration>,
     loop_timeout: Option<Duration>,
     turn_hook: Option<TurnHook<S>>,
+    assistant_message_hook: Option<AssistantMessageHook<S>>,
     events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
     state: SharedMessages,
     turn_running: SharedTurnRunning,
@@ -677,6 +805,7 @@ where
             turn_timeout: init.turn_timeout,
             loop_timeout: init.loop_timeout,
             turn_hook: init.turn_hook,
+            assistant_message_hook: init.assistant_message_hook,
             events_tx: init.events_tx,
             state: init.state,
             turn_running: init.turn_running,
@@ -837,6 +966,19 @@ impl PreparedTurn {
             .map(|messages| self.append_messages(messages))
             .unwrap_or_default()
     }
+
+    fn assistant_messages(&self, partial_turn: &PartialTurn, message: Message) -> Vec<Message> {
+        let mut messages = Vec::new();
+        if !self.prelude.is_empty() {
+            messages.extend(self.prelude.clone());
+        }
+        if self.commit_prompt {
+            messages.push(self.prompt.clone());
+        }
+        messages.extend(partial_turn.completed_messages.clone());
+        messages.push(message);
+        messages
+    }
 }
 
 impl<M, P, S> Runner<M, P, S>
@@ -929,6 +1071,7 @@ where
         });
 
         let mut partial_turn = PartialTurn::default();
+        let mut assistant_message_hook = None;
         let mut commands_closed = false;
         let turn_deadline = self
             .turn_timeout
@@ -944,6 +1087,7 @@ where
         let mut stream = loop {
             let deadline = next_timeout(turn_deadline, loop_deadline);
             if let Some(deadline) = elapsed_timeout(deadline) {
+                wait_for_assistant_message_hook(&mut assistant_message_hook).await?;
                 return self.timeout_turn(&turn, &partial_turn, deadline).await;
             }
 
@@ -963,6 +1107,7 @@ where
                 }
                 _ = wait_for_timeout(deadline), if deadline.is_some() => {
                     let deadline = deadline.expect("timeout branch requires a deadline");
+                    wait_for_assistant_message_hook(&mut assistant_message_hook).await?;
                     return self.timeout_turn(&turn, &partial_turn, deadline).await;
                 }
                 stream = &mut stream_future => break stream,
@@ -972,6 +1117,7 @@ where
         loop {
             let deadline = next_timeout(turn_deadline, loop_deadline);
             if let Some(deadline) = elapsed_timeout(deadline) {
+                wait_for_assistant_message_hook(&mut assistant_message_hook).await?;
                 return self.timeout_turn(&turn, &partial_turn, deadline).await;
             }
 
@@ -982,6 +1128,9 @@ where
                         continue;
                     };
 
+                    if matches!(command, Command::Interrupt(_) | Command::Abort) {
+                        wait_for_assistant_message_hook(&mut assistant_message_hook).await?;
+                    }
                     if let Some(action) = self
                         .handle_turn_command(command, &turn, &partial_turn)
                         .await?
@@ -991,10 +1140,16 @@ where
                 }
                 _ = wait_for_timeout(deadline), if deadline.is_some() => {
                     let deadline = deadline.expect("timeout branch requires a deadline");
+                    wait_for_assistant_message_hook(&mut assistant_message_hook).await?;
                     return self.timeout_turn(&turn, &partial_turn, deadline).await;
+                }
+                hook = poll_assistant_message_hook(&mut assistant_message_hook), if assistant_message_hook.is_some() => {
+                    assistant_message_hook = None;
+                    hook?;
                 }
                 item = stream.next() => {
                     let Some(item) = item else {
+                        wait_for_assistant_message_hook(&mut assistant_message_hook).await?;
                         self.set_turn_running(false);
                         return Ok(PromptAction::Continue);
                     };
@@ -1003,13 +1158,19 @@ where
                         Ok(item) => {
                             self.emit(AgentLoopEvent::Rig(item.clone()));
                             if let Some(end_reason) = self
-                                .handle_stream_item(item, &turn, &mut partial_turn)
+                                .handle_stream_item(
+                                    item,
+                                    &turn,
+                                    &mut partial_turn,
+                                    &mut assistant_message_hook,
+                                )
                                 .await?
                             {
                                 return Ok(PromptAction::Finish(end_reason));
                             }
                         }
                         Err(err) => {
+                            wait_for_assistant_message_hook(&mut assistant_message_hook).await?;
                             if let Some(history) = history_from_error(&err) {
                                 if let CommitOutcome::Abort(end_reason) = self
                                     .commit_recovered_history(&turn.committed_base_history, history)
@@ -1075,13 +1236,22 @@ where
         item: MultiTurnStreamItem<M::StreamingResponse>,
         turn: &PreparedTurn,
         partial_turn: &mut PartialTurn,
+        assistant_message_hook: &mut Option<AssistantMessageHookTask>,
     ) -> Result<Option<EndReason>, AgentLoopError> {
         match item {
             MultiTurnStreamItem::StreamAssistantItem(item) => {
-                partial_turn.note_assistant_item(item)
+                let is_message_boundary = matches!(item, StreamedAssistantContent::ToolCall { .. });
+                partial_turn.note_assistant_item(item);
+                if is_message_boundary {
+                    self.start_assistant_message_hook(turn, partial_turn, assistant_message_hook)
+                        .await?;
+                }
             }
             MultiTurnStreamItem::StreamUserItem(item) => partial_turn.note_user_item(item),
             MultiTurnStreamItem::FinalResponse(final_response) => {
+                self.start_assistant_message_hook(turn, partial_turn, assistant_message_hook)
+                    .await?;
+                wait_for_assistant_message_hook(assistant_message_hook).await?;
                 self.last_response = Some(final_response.response().to_string());
                 if let Some(messages) = final_response.history()
                     && let CommitOutcome::Abort(end_reason) = self
@@ -1099,6 +1269,43 @@ where
         }
 
         Ok(None)
+    }
+
+    async fn start_assistant_message_hook(
+        &self,
+        turn: &PreparedTurn,
+        partial_turn: &mut PartialTurn,
+        assistant_message_hook: &mut Option<AssistantMessageHookTask>,
+    ) -> Result<(), AgentLoopError> {
+        let Some(message) = partial_turn.assistant_message() else {
+            return Ok(());
+        };
+
+        wait_for_assistant_message_hook(assistant_message_hook).await?;
+
+        let messages = turn.assistant_messages(partial_turn, message.clone());
+        let mut history = self.history_snapshot();
+        history.extend(messages.clone());
+        partial_turn.mark_assistant_message_finished(message.clone());
+        self.emit(AgentLoopEvent::AssistantMessageFinished {
+            message: message.clone(),
+            messages: messages.clone(),
+        });
+
+        let Some(hook) = &self.assistant_message_hook else {
+            return Ok(());
+        };
+
+        let context = AssistantMessageContext {
+            message,
+            history,
+            new_messages: messages,
+        };
+        *assistant_message_hook = Some(AssistantMessageHookTask::spawn(hook(
+            self.app_state.clone(),
+            context,
+        )));
+        Ok(())
     }
 
     async fn commit_append(
@@ -1218,9 +1425,16 @@ impl CommitEvent {
 
 #[derive(Default)]
 struct PartialTurn {
-    pending_tool_calls: HashMap<String, ToolCall>,
+    pending_tool_calls: Vec<PendingToolCall>,
     assistant_content: Vec<AssistantContent>,
+    finished_assistant_message: Option<Message>,
+    active_tool_results: Vec<UserContent>,
     completed_messages: Vec<Message>,
+}
+
+struct PendingToolCall {
+    internal_call_id: String,
+    tool_call: ToolCall,
 }
 
 impl PartialTurn {
@@ -1240,12 +1454,40 @@ impl PartialTurn {
                 internal_call_id,
                 tool_call,
             } => {
-                self.pending_tool_calls.insert(internal_call_id, tool_call);
+                self.pending_tool_calls.push(PendingToolCall {
+                    internal_call_id,
+                    tool_call,
+                });
             }
             StreamedAssistantContent::ToolCallDelta { .. }
             | StreamedAssistantContent::ReasoningDelta { .. }
             | StreamedAssistantContent::Final(_) => {}
         }
+    }
+
+    fn assistant_message(&self) -> Option<Message> {
+        if self.finished_assistant_message.is_some() || !self.active_tool_results.is_empty() {
+            return None;
+        }
+
+        let mut content = self.assistant_content.clone();
+        content.extend(
+            self.pending_tool_calls
+                .iter()
+                .map(|call| AssistantContent::ToolCall(call.tool_call.clone())),
+        );
+
+        if content.is_empty() {
+            return None;
+        }
+
+        OneOrMany::many(content)
+            .ok()
+            .map(|content| Message::Assistant { id: None, content })
+    }
+
+    fn mark_assistant_message_finished(&mut self, message: Message) {
+        self.finished_assistant_message = Some(message);
     }
 
     fn note_user_item(&mut self, item: StreamedUserContent) {
@@ -1254,25 +1496,34 @@ impl PartialTurn {
             tool_result,
         } = item;
 
-        let Some(tool_call) = self.pending_tool_calls.remove(&internal_call_id) else {
-            return;
-        };
-
-        self.assistant_content
-            .push(AssistantContent::ToolCall(tool_call));
-
-        let Ok(assistant_content) = OneOrMany::many(std::mem::take(&mut self.assistant_content))
+        let Some(position) = self
+            .pending_tool_calls
+            .iter()
+            .position(|call| call.internal_call_id == internal_call_id)
         else {
             return;
         };
 
-        self.completed_messages.push(Message::Assistant {
-            id: None,
-            content: assistant_content,
-        });
-        self.completed_messages.push(Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(tool_result)),
-        });
+        if self.active_tool_results.is_empty() {
+            let assistant_message = self
+                .finished_assistant_message
+                .take()
+                .or_else(|| self.assistant_message());
+            if let Some(message) = assistant_message {
+                self.assistant_content.clear();
+                self.completed_messages.push(message);
+            }
+        }
+
+        self.pending_tool_calls.remove(position);
+        self.active_tool_results
+            .push(UserContent::ToolResult(tool_result));
+
+        if self.pending_tool_calls.is_empty()
+            && let Ok(content) = OneOrMany::many(std::mem::take(&mut self.active_tool_results))
+        {
+            self.completed_messages.push(Message::User { content });
+        }
     }
 
     fn append_messages(&self, prompt: &Message) -> Option<Vec<Message>> {
@@ -1368,6 +1619,89 @@ fn validate_resume_history(messages: &[Message]) -> Result<(), InvalidMessageHis
             "resume requires at least one committed message",
         )),
     }
+}
+
+fn repair_unanswered_tool_calls(mut messages: Vec<Message>, repair_message: &str) -> Vec<Message> {
+    let mut index = 0;
+    while index < messages.len() {
+        let expected_ids = match &messages[index] {
+            Message::Assistant { content, .. } => assistant_tool_call_ids(content),
+            Message::User { .. } | Message::System { .. } => {
+                index += 1;
+                continue;
+            }
+        };
+
+        if expected_ids.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        let next_index = index + 1;
+        let Some(next_message) = messages.get_mut(next_index) else {
+            messages.push(repair_tool_result_message(&expected_ids, repair_message));
+            index += 2;
+            continue;
+        };
+
+        let Message::User { content } = next_message else {
+            messages.insert(
+                next_index,
+                repair_tool_result_message(&expected_ids, repair_message),
+            );
+            index += 2;
+            continue;
+        };
+
+        let result_ids = tool_result_ids(content);
+        if result_ids.is_empty() {
+            messages.insert(
+                next_index,
+                repair_tool_result_message(&expected_ids, repair_message),
+            );
+            index += 2;
+            continue;
+        }
+
+        let missing_ids = expected_ids
+            .iter()
+            .filter(|id| !result_ids.contains(id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if missing_ids.is_empty() {
+            index += 2;
+            continue;
+        }
+
+        let mut repaired_content = content.iter().cloned().collect::<Vec<_>>();
+        repaired_content.extend(repair_tool_result_contents(&missing_ids, repair_message));
+        if let Ok(next_content) = OneOrMany::many(repaired_content) {
+            *content = next_content;
+        }
+        index += 2;
+    }
+
+    messages
+}
+
+fn repair_tool_result_message(ids: &[String], repair_message: &str) -> Message {
+    Message::User {
+        content: OneOrMany::many(repair_tool_result_contents(ids, repair_message))
+            .expect("repair tool result content is non-empty"),
+    }
+}
+
+fn repair_tool_result_contents(ids: &[String], repair_message: &str) -> Vec<UserContent> {
+    ids.iter()
+        .map(|id| {
+            UserContent::ToolResult(ToolResult {
+                id: id.clone(),
+                call_id: None,
+                content: ToolResultContent::from_tool_output(repair_message.to_string()),
+            })
+        })
+        .collect()
 }
 
 fn assistant_tool_call_ids(content: &OneOrMany<AssistantContent>) -> Vec<String> {
@@ -1667,20 +2001,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn invalid_message_history_with_unanswered_tool_call_fails_before_request() {
+    async fn unanswered_tool_call_history_is_repaired_before_prompt() {
         let model = MockCompletionModel::from_stream_turns([[
-            MockStreamEvent::text("unused"),
+            MockStreamEvent::text("recovered"),
             MockStreamEvent::final_response_with_default_usage(),
         ]]);
         let agent = AgentBuilder::new(model.clone()).build();
         let agent_loop =
             AgentLoop::new(agent).with_history([assistant_tool_call_message("call_1")]);
 
+        let result = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .unwrap();
+
+        assert_eq!(result.end_reason, EndReason::Idle);
+        assert_eq!(model.request_count(), 1);
+        let requests = model.requests();
+        assert_eq!(
+            tool_result_texts(requests[0].chat_history.iter()),
+            vec![DEFAULT_TOOL_CRASH_MESSAGE]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unanswered_tool_call_repair_message_can_be_overridden() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("recovered"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model.clone()).build();
+        let agent_loop = AgentLoop::new(agent)
+            .with_history([assistant_tool_call_message("call_1")])
+            .with_unanswered_tool_call_repair_message("custom tool crash message");
+
+        agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .unwrap();
+
+        let requests = model.requests();
+        assert_eq!(
+            tool_result_texts(requests[0].chat_history.iter()),
+            vec!["custom tool crash message"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_message_history_with_orphan_tool_result_still_fails_before_request() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("unused"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model.clone()).build();
+        let agent_loop = AgentLoop::new(agent).with_history([Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(test_tool_result("call_1"))),
+        }]);
+
         let err = agent_loop
             .prompt(Message::user("start"))
             .wait()
             .await
-            .expect_err("invalid message history should fail before a request is sent");
+            .expect_err("unrepairable message history should fail before a request is sent");
 
         assert!(matches!(err, AgentLoopError::InvalidMessageHistory(_)));
         assert_eq!(model.request_count(), 0);
@@ -1998,6 +2382,31 @@ mod tests {
         assert!(validate_resume_history(&[Message::system("summary")]).is_err());
     }
 
+    #[test]
+    fn repair_unanswered_tool_calls_adds_missing_results_to_next_user_message() {
+        let history = vec![
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::many(vec![
+                    AssistantContent::ToolCall(test_tool_call("call_1")),
+                    AssistantContent::ToolCall(test_tool_call("call_2")),
+                ])
+                .unwrap(),
+            },
+            Message::User {
+                content: OneOrMany::one(UserContent::ToolResult(test_tool_result("call_1"))),
+            },
+        ];
+
+        let repaired = repair_unanswered_tool_calls(history, "tool repaired");
+
+        validate_message_history(&repaired).unwrap();
+        assert_eq!(
+            tool_result_texts(repaired.iter()),
+            vec!["echoed", "tool repaired"]
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn abort_returns_aborted_end_reason() {
         let model = MockCompletionModel::from_stream_turns([[
@@ -2098,6 +2507,216 @@ mod tests {
         assert_eq!(result.end_reason, EndReason::Idle);
         let seen = seen.lock().unwrap();
         assert_eq!(&seen[..], &[(2, 2, Some("start".to_string()))]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assistant_message_hook_runs_while_tool_execution_is_in_flight() {
+        let hook_entered = Arc::new(Notify::new());
+        let hook_release = Arc::new(Notify::new());
+        let tool_entered = Arc::new(Notify::new());
+        let tool_release = Arc::new(Notify::new());
+        let model = MockCompletionModel::from_stream_turns([
+            vec![
+                MockStreamEvent::text("I will call the tool."),
+                MockStreamEvent::tool_call("call_1", BlockingTool::NAME, serde_json::json!({})),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model)
+            .tool(BlockingTool {
+                entered: tool_entered.clone(),
+                release: tool_release.clone(),
+            })
+            .build();
+        let seen = Arc::new(Mutex::new(Vec::<(usize, usize, usize)>::new()));
+        let hook_seen = seen.clone();
+        let hook_entered_for_hook = hook_entered.clone();
+        let hook_release_for_hook = hook_release.clone();
+        let agent_loop = AgentLoop::new(agent).on_assistant_message_finished(move |_, context| {
+            let hook_seen = hook_seen.clone();
+            let hook_entered = hook_entered_for_hook.clone();
+            let hook_release = hook_release_for_hook.clone();
+            async move {
+                let tool_call_count = match &context.message {
+                    Message::Assistant { content, .. } => assistant_tool_call_ids(content).len(),
+                    _ => 0,
+                };
+                hook_seen.lock().unwrap().push((
+                    context.history.len(),
+                    context.new_messages.len(),
+                    tool_call_count,
+                ));
+                if tool_call_count > 0 {
+                    hook_entered.notify_one();
+                    hook_release.notified().await;
+                }
+                Ok::<_, std::io::Error>(())
+            }
+        });
+
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
+
+        timeout(Duration::from_secs(1), hook_entered.notified())
+            .await
+            .expect("assistant message hook should start");
+        timeout(Duration::from_secs(1), tool_entered.notified())
+            .await
+            .expect("tool execution should start while hook is still pending");
+
+        hook_release.notify_one();
+        tool_release.notify_one();
+        let result = timeout(Duration::from_secs(1), handle.wait())
+            .await
+            .expect("loop should finish after hook and tool are released")
+            .unwrap();
+
+        assert_eq!(result.end_reason, EndReason::Idle);
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|entry| *entry == (2, 2, 1)));
+        assert!(seen.iter().any(|entry| *entry == (4, 4, 0)));
+        let events = drain_events(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentLoopEvent::AssistantMessageFinished { message, messages }
+                    if matches!(message, Message::Assistant { .. }) && messages.len() == 2
+            )
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assistant_message_snapshot_can_be_repaired_after_restart() {
+        let persisted_messages = Arc::new(Mutex::new(None::<Vec<Message>>));
+        let persisted = Arc::new(Notify::new());
+        let tool_entered = Arc::new(Notify::new());
+        let tool_release = Arc::new(Notify::new());
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("I will call the tool."),
+            MockStreamEvent::tool_call("call_1", BlockingTool::NAME, serde_json::json!({})),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model)
+            .tool(BlockingTool {
+                entered: tool_entered.clone(),
+                release: tool_release.clone(),
+            })
+            .build();
+        let messages_for_hook = persisted_messages.clone();
+        let persisted_for_hook = persisted.clone();
+        let agent_loop = AgentLoop::new(agent).on_assistant_message_finished(move |_, context| {
+            let messages_for_hook = messages_for_hook.clone();
+            let persisted = persisted_for_hook.clone();
+            async move {
+                let has_tool_call = matches!(
+                    &context.message,
+                    Message::Assistant { content, .. } if !assistant_tool_call_ids(content).is_empty()
+                );
+                if has_tool_call {
+                    *messages_for_hook.lock().unwrap() = Some(context.new_messages);
+                    persisted.notify_one();
+                }
+                Ok::<_, std::io::Error>(())
+            }
+        });
+
+        let handle = agent_loop.prompt(Message::user("start"));
+
+        timeout(Duration::from_secs(1), persisted.notified())
+            .await
+            .expect("assistant snapshot should be persisted before tool result");
+        timeout(Duration::from_secs(1), tool_entered.notified())
+            .await
+            .expect("tool should be running when the process crashes");
+
+        drop(handle);
+        tool_release.notify_waiters();
+
+        let partial_history = persisted_messages
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("assistant snapshot should be captured");
+        assert!(validate_message_history(&partial_history).is_err());
+
+        let recovery_model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("recovered"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let recovery_agent = AgentBuilder::new(recovery_model.clone()).build();
+        let result = AgentLoop::new(recovery_agent)
+            .with_history(partial_history)
+            .resume()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+
+        validate_message_history(&result.history).unwrap();
+        assert_eq!(
+            tool_result_texts(result.history.iter()),
+            vec![DEFAULT_TOOL_CRASH_MESSAGE]
+        );
+        assert_eq!(
+            assistant_texts(result.history.iter()),
+            vec!["I will call the tool.", "recovered"]
+        );
+        assert_eq!(recovery_model.request_count(), 1);
+
+        let requests = recovery_model.requests();
+        assert_eq!(
+            tool_result_texts(requests[0].chat_history.iter()),
+            vec![DEFAULT_TOOL_CRASH_MESSAGE]
+        );
+        let tool_call_ids = requests[0]
+            .chat_history
+            .iter()
+            .flat_map(|message| match message {
+                Message::Assistant { content, .. } => assistant_tool_call_ids(content),
+                Message::User { .. } | Message::System { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_call_ids, vec!["call_1"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assistant_message_hook_error_stops_the_loop() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("first"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model.clone()).build();
+        let agent_loop = AgentLoop::new(agent).on_assistant_message_finished(|_, _context| async {
+            Err(std::io::Error::other("assistant hook failed"))
+        });
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
+
+        let err = handle
+            .wait()
+            .await
+            .expect_err("assistant message hook failure should fail the run");
+
+        assert!(matches!(err, AgentLoopError::AssistantMessageHook(_)));
+        assert_eq!(model.request_count(), 1);
+
+        let events = drain_events(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentLoopEvent::LoopFailed { error }
+                    if error.message.contains("assistant message hook failed: assistant hook failed")
+            )
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentLoopEvent::LoopEnded { .. }))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2745,6 +3364,34 @@ mod tests {
             .collect()
     }
 
+    fn tool_result_texts<'a>(messages: impl IntoIterator<Item = &'a Message>) -> Vec<String> {
+        messages
+            .into_iter()
+            .flat_map(|message| {
+                let Message::User { content } = message else {
+                    return Vec::new();
+                };
+
+                content
+                    .iter()
+                    .filter_map(|item| {
+                        let UserContent::ToolResult(tool_result) = item else {
+                            return None;
+                        };
+
+                        tool_result
+                            .content
+                            .iter()
+                            .find_map(|content| match content {
+                                ToolResultContent::Text(text) => Some(text.text.clone()),
+                                ToolResultContent::Image(_) => None,
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn first_user_text(message: &Message) -> Option<String> {
         let Message::User { content } = message else {
             return None;
@@ -2884,6 +3531,7 @@ mod tests {
             turn_timeout: None,
             loop_timeout: None,
             turn_hook: None,
+            assistant_message_hook: None,
             events_tx,
             state,
             turn_running: Arc::new(AtomicBool::new(false)),

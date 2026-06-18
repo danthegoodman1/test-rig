@@ -140,6 +140,26 @@ A hook can return:
 | `ReplaceHistory(messages)` | Replace the in-memory history with this complete history. |
 | `Abort { reason }` | Keep the candidate full history, then stop the loop with `EndReason::AbortedByHook`. |
 
+Use `on_assistant_message_finished` when you need to persist an assistant
+snapshot before tool results are committed:
+
+```rust
+let agent_loop = AgentLoop::new(agent).on_assistant_message_finished(
+    |_app_state, context| async move {
+        println!("persist assistant snapshot: {} messages", context.new_messages.len());
+        Ok::<_, std::convert::Infallible>(())
+    },
+);
+```
+
+For tool-call turns, the hook future is polled while Rig continues tool
+execution, then awaited before later commit/error boundaries.
+If the snapshot contains tool calls, it is not yet valid provider history until
+matching tool results exist. Rigloop repairs loaded histories with unanswered
+assistant tool calls by inserting synthetic failed tool results before
+validation. Override that synthetic result text with
+`with_unanswered_tool_call_repair_message(...)`.
+
 ## Events
 
 Subscribe to lifecycle events and raw Rig stream items:
@@ -151,6 +171,9 @@ while let Ok(event) = events.recv().await {
     match event {
         rigloop::AgentLoopEvent::Rig(item) => {
             // Full Rig stream granularity, including text deltas and tool deltas.
+        }
+        rigloop::AgentLoopEvent::AssistantMessageFinished { messages, .. } => {
+            // A partial assistant snapshot is available for persistence.
         }
         rigloop::AgentLoopEvent::TurnCommitted { messages } => {
             // A valid append batch was committed.
@@ -180,6 +203,11 @@ let loop_from_history = AgentLoop::new(agent)
 `resume()` validates that the committed Rig message history is usable before
 starting another model call. Invalid tool-call ordering is rejected before it
 can be sent to a provider.
+
+Histories loaded from partial assistant-message persistence are repaired by
+default when an assistant tool call is missing a matching tool result. Rigloop
+inserts a failed tool result that says `tool crashed before a result returned`;
+other invalid message ordering still fails validation.
 
 ## End Reasons
 
