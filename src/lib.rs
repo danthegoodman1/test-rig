@@ -2577,8 +2577,8 @@ mod tests {
 
         assert_eq!(result.end_reason, EndReason::Idle);
         let seen = seen.lock().unwrap();
-        assert!(seen.iter().any(|entry| *entry == (2, 2, 1)));
-        assert!(seen.iter().any(|entry| *entry == (4, 4, 0)));
+        assert!(seen.contains(&(2, 2, 1)));
+        assert!(seen.contains(&(4, 4, 0)));
         let events = drain_events(&mut events);
         assert!(events.iter().any(|event| {
             matches!(
