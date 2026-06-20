@@ -31,6 +31,7 @@ use tokio::{
 
 pub type TurnHookError = Box<dyn Error + Send + Sync + 'static>;
 pub type AssistantMessageHookError = Box<dyn Error + Send + Sync + 'static>;
+pub type ToolResultPersistenceError = Box<dyn Error + Send + Sync + 'static>;
 
 type TurnHookFuture = Pin<Box<dyn Future<Output = Result<TurnHookAction, TurnHookError>> + Send>>;
 type TurnHook<S> = Arc<dyn Fn(Arc<S>, TurnHookContext) -> TurnHookFuture + Send + Sync>;
@@ -38,6 +39,8 @@ type AssistantMessageHookFuture =
     Pin<Box<dyn Future<Output = Result<(), AssistantMessageHookError>> + Send>>;
 type AssistantMessageHook<S> =
     Arc<dyn Fn(Arc<S>, AssistantMessageContext) -> AssistantMessageHookFuture + Send + Sync>;
+pub type ToolResultPersistenceFuture<T> =
+    Pin<Box<dyn Future<Output = Result<T, ToolResultPersistenceError>> + Send>>;
 type SharedMessages = Arc<Mutex<Vec<Message>>>;
 type SharedTurnRunning = Arc<AtomicBool>;
 const EVENT_BUFFER_SIZE: usize = 1024;
@@ -48,6 +51,63 @@ fn lock_messages(messages: &SharedMessages) -> MutexGuard<'_, Vec<Message>> {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+/// Stable lookup key for an individual tool result.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ToolResultKey {
+    /// Rig/provider tool-call id.
+    pub id: String,
+    /// Provider-specific call id, when distinct from `id`.
+    pub call_id: Option<String>,
+}
+
+impl ToolResultKey {
+    pub fn new(id: impl Into<String>, call_id: Option<String>) -> Self {
+        Self {
+            id: id.into(),
+            call_id,
+        }
+    }
+
+    pub fn from_tool_call(tool_call: &ToolCall) -> Self {
+        Self::new(tool_call.id.clone(), tool_call.call_id.clone())
+    }
+
+    pub fn from_tool_result(tool_result: &ToolResult) -> Self {
+        Self::new(tool_result.id.clone(), tool_result.call_id.clone())
+    }
+}
+
+impl From<&ToolCall> for ToolResultKey {
+    fn from(tool_call: &ToolCall) -> Self {
+        Self::from_tool_call(tool_call)
+    }
+}
+
+impl From<&ToolResult> for ToolResultKey {
+    fn from(tool_result: &ToolResult) -> Self {
+        Self::from_tool_result(tool_result)
+    }
+}
+
+/// Optional persistence hook for tool results as they complete.
+///
+/// When configured, each returned tool result is persisted before the result is
+/// committed into the loop history. If startup history contains assistant tool
+/// calls without corresponding user tool results, repair first asks this store
+/// for each missing result before falling back to the configured recovery text.
+pub trait IncrementalToolResultPersistence: Send + Sync + 'static {
+    fn persist_tool_result(
+        &self,
+        key: ToolResultKey,
+        result: ToolResult,
+    ) -> ToolResultPersistenceFuture<()>;
+
+    fn load_tool_result(
+        &self,
+        key: ToolResultKey,
+    ) -> ToolResultPersistenceFuture<Option<ToolResult>>;
 }
 
 /// A small harness around `rig::agent::Agent` that owns the queue between prompts.
@@ -65,6 +125,7 @@ where
     turn_hook: Option<TurnHook<S>>,
     assistant_message_hook: Option<AssistantMessageHook<S>>,
     unanswered_tool_call_repair: Option<String>,
+    tool_result_persistence: Option<Arc<dyn IncrementalToolResultPersistence>>,
 }
 
 impl<M, P> AgentLoop<M, P, ()>
@@ -83,6 +144,7 @@ where
             turn_hook: None,
             assistant_message_hook: None,
             unanswered_tool_call_repair: Some(DEFAULT_TOOL_REPAIR_MESSAGE.to_string()),
+            tool_result_persistence: None,
         }
     }
 }
@@ -115,6 +177,7 @@ where
             turn_hook,
             assistant_message_hook,
             unanswered_tool_call_repair: self.unanswered_tool_call_repair,
+            tool_result_persistence: self.tool_result_persistence,
         }
     }
 }
@@ -156,6 +219,15 @@ where
     /// assistant tool calls that do not have matching tool results.
     pub fn with_unanswered_tool_call_repair_message(mut self, message: impl Into<String>) -> Self {
         self.unanswered_tool_call_repair = Some(message.into());
+        self
+    }
+
+    /// Persist each completed tool result and use those results during startup repair.
+    pub fn with_incremental_tool_result_persistence(
+        mut self,
+        persistence: impl IncrementalToolResultPersistence,
+    ) -> Self {
+        self.tool_result_persistence = Some(Arc::new(persistence));
         self
     }
 
@@ -211,17 +283,23 @@ where
 {
     /// Start the loop with an initial user prompt and return a control handle.
     pub fn prompt(&self, prompt: impl Into<Message>) -> AgentLoopHandle<M::StreamingResponse> {
-        self.start(
-            PendingTurn::single(prompt.into()),
-            self.repaired_initial_history(),
-        )
+        self.start(PendingTurn::single(prompt.into()), self.initial_history())
     }
 
     /// Start the loop from the seeded history without appending a new prompt.
     pub fn resume(&self) -> Result<AgentLoopHandle<M::StreamingResponse>, AgentLoopError> {
-        let initial_history = self.repaired_initial_history();
-        validate_resume_history(&initial_history).map_err(AgentLoopError::InvalidMessageHistory)?;
-        Ok(self.start(PendingTurn::Resume, initial_history))
+        let validation_history = self.repaired_initial_history();
+        validate_resume_history(&validation_history)
+            .map_err(AgentLoopError::InvalidMessageHistory)?;
+        Ok(self.start(PendingTurn::Resume, self.initial_history()))
+    }
+
+    fn initial_history(&self) -> Vec<Message> {
+        if self.tool_result_persistence.is_some() {
+            self.initial_history.clone()
+        } else {
+            self.repaired_initial_history()
+        }
     }
 
     fn repaired_initial_history(&self) -> Vec<Message> {
@@ -249,6 +327,8 @@ where
             loop_timeout: self.loop_timeout,
             turn_hook: self.turn_hook.clone(),
             assistant_message_hook: self.assistant_message_hook.clone(),
+            unanswered_tool_call_repair: self.unanswered_tool_call_repair.clone(),
+            tool_result_persistence: self.tool_result_persistence.clone(),
             events_tx: events_tx.clone(),
             state: state.clone(),
             turn_running: turn_running.clone(),
@@ -567,6 +647,7 @@ pub enum AgentLoopError {
     InvalidMessageHistory(InvalidMessageHistoryError),
     TurnHook(TurnHookError),
     AssistantMessageHook(AssistantMessageHookError),
+    ToolResultPersistence(ToolResultPersistenceError),
     Rig(StreamingError),
     TaskJoin(tokio::task::JoinError),
 }
@@ -578,6 +659,7 @@ impl fmt::Display for AgentLoopError {
             Self::InvalidMessageHistory(err) => write!(f, "{err}"),
             Self::TurnHook(err) => write!(f, "turn hook failed: {err}"),
             Self::AssistantMessageHook(err) => write!(f, "assistant message hook failed: {err}"),
+            Self::ToolResultPersistence(err) => write!(f, "tool result persistence failed: {err}"),
             Self::Rig(err) => write!(f, "{err}"),
             Self::TaskJoin(err) => write!(f, "{err}"),
         }
@@ -590,6 +672,7 @@ impl Error for AgentLoopError {
             Self::InvalidMessageHistory(err) => Some(err),
             Self::TurnHook(err) => Some(err.as_ref()),
             Self::AssistantMessageHook(err) => Some(err.as_ref()),
+            Self::ToolResultPersistence(err) => Some(err.as_ref()),
             Self::Rig(err) => Some(err),
             Self::TaskJoin(err) => Some(err),
             Self::CommandChannelClosed => None,
@@ -756,6 +839,8 @@ where
     loop_timeout: Option<Duration>,
     turn_hook: Option<TurnHook<S>>,
     assistant_message_hook: Option<AssistantMessageHook<S>>,
+    unanswered_tool_call_repair: Option<String>,
+    tool_result_persistence: Option<Arc<dyn IncrementalToolResultPersistence>>,
     events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
     state: SharedMessages,
     turn_running: SharedTurnRunning,
@@ -778,6 +863,8 @@ where
     loop_timeout: Option<Duration>,
     turn_hook: Option<TurnHook<S>>,
     assistant_message_hook: Option<AssistantMessageHook<S>>,
+    unanswered_tool_call_repair: Option<String>,
+    tool_result_persistence: Option<Arc<dyn IncrementalToolResultPersistence>>,
     events_tx: broadcast::Sender<AgentLoopEvent<M::StreamingResponse>>,
     state: SharedMessages,
     turn_running: SharedTurnRunning,
@@ -806,6 +893,8 @@ where
             loop_timeout: init.loop_timeout,
             turn_hook: init.turn_hook,
             assistant_message_hook: init.assistant_message_hook,
+            unanswered_tool_call_repair: init.unanswered_tool_call_repair,
+            tool_result_persistence: init.tool_result_persistence,
             events_tx: init.events_tx,
             state: init.state,
             turn_running: init.turn_running,
@@ -1008,6 +1097,7 @@ where
         commands_rx: &mut mpsc::UnboundedReceiver<Command>,
     ) -> Result<AgentLoopResult, AgentLoopError> {
         self.emit(AgentLoopEvent::LoopStarted);
+        self.repair_initial_history().await?;
         let loop_deadline = self
             .loop_timeout
             .map(|timeout| TimeoutDeadline::new(TimeoutKind::Loop, timeout));
@@ -1247,7 +1337,12 @@ where
                         .await?;
                 }
             }
-            MultiTurnStreamItem::StreamUserItem(item) => partial_turn.note_user_item(item),
+            MultiTurnStreamItem::StreamUserItem(item) => {
+                let StreamedUserContent::ToolResult { tool_result, .. } = &item;
+                self.persist_incremental_tool_result(tool_result.clone())
+                    .await?;
+                partial_turn.note_user_item(item);
+            }
             MultiTurnStreamItem::FinalResponse(final_response) => {
                 self.start_assistant_message_hook(turn, partial_turn, assistant_message_hook)
                     .await?;
@@ -1269,6 +1364,36 @@ where
         }
 
         Ok(None)
+    }
+
+    async fn repair_initial_history(&mut self) -> Result<(), AgentLoopError> {
+        let Some(repair_message) = &self.unanswered_tool_call_repair else {
+            return Ok(());
+        };
+
+        let repaired = repair_unanswered_tool_calls_with_persistence(
+            self.history_snapshot(),
+            repair_message,
+            self.tool_result_persistence.as_ref(),
+        )
+        .await?;
+        *lock_messages(&self.state) = repaired;
+        Ok(())
+    }
+
+    async fn persist_incremental_tool_result(
+        &self,
+        tool_result: ToolResult,
+    ) -> Result<(), AgentLoopError> {
+        let Some(persistence) = &self.tool_result_persistence else {
+            return Ok(());
+        };
+
+        let key = ToolResultKey::from_tool_result(&tool_result);
+        persistence
+            .persist_tool_result(key, tool_result)
+            .await
+            .map_err(AgentLoopError::ToolResultPersistence)
     }
 
     async fn start_assistant_message_hook(
@@ -1685,6 +1810,122 @@ fn repair_unanswered_tool_calls(mut messages: Vec<Message>, repair_message: &str
     messages
 }
 
+async fn repair_unanswered_tool_calls_with_persistence(
+    mut messages: Vec<Message>,
+    repair_message: &str,
+    persistence: Option<&Arc<dyn IncrementalToolResultPersistence>>,
+) -> Result<Vec<Message>, AgentLoopError> {
+    let mut index = 0;
+    while index < messages.len() {
+        let expected_calls = match &messages[index] {
+            Message::Assistant { content, .. } => assistant_tool_calls(content),
+            Message::User { .. } | Message::System { .. } => {
+                index += 1;
+                continue;
+            }
+        };
+
+        if expected_calls.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        let next_index = index + 1;
+        match messages.get(next_index) {
+            Some(Message::User { content }) if !tool_result_ids(content).is_empty() => {
+                let result_ids = tool_result_ids(content);
+                if expected_calls
+                    .iter()
+                    .any(|tool_call| !result_ids.contains(&tool_call.id))
+                {
+                    let repaired_content = repair_tool_result_content(
+                        content.iter().cloned().collect(),
+                        &expected_calls,
+                        repair_message,
+                        persistence,
+                    )
+                    .await?;
+                    let repaired_content = OneOrMany::many(repaired_content)
+                        .expect("repair tool result content is non-empty");
+                    if let Some(Message::User { content }) = messages.get_mut(next_index) {
+                        *content = repaired_content;
+                    }
+                }
+            }
+            _ => {
+                let repaired_content = repair_tool_result_content(
+                    Vec::new(),
+                    &expected_calls,
+                    repair_message,
+                    persistence,
+                )
+                .await?;
+                let message = Message::User {
+                    content: OneOrMany::many(repaired_content)
+                        .expect("repair tool result content is non-empty"),
+                };
+                if next_index < messages.len() {
+                    messages.insert(next_index, message);
+                } else {
+                    messages.push(message);
+                }
+            }
+        }
+
+        index += 2;
+    }
+
+    Ok(messages)
+}
+
+async fn repair_tool_result_content(
+    existing_content: Vec<UserContent>,
+    expected_calls: &[ToolCall],
+    repair_message: &str,
+    persistence: Option<&Arc<dyn IncrementalToolResultPersistence>>,
+) -> Result<Vec<UserContent>, AgentLoopError> {
+    let mut repaired = existing_content
+        .iter()
+        .filter(|item| !matches!(item, UserContent::ToolResult(_)))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for tool_call in expected_calls {
+        let existing_result = existing_content.iter().find_map(|item| match item {
+            UserContent::ToolResult(tool_result) if tool_result.id == tool_call.id => {
+                Some(tool_result.clone())
+            }
+            _ => None,
+        });
+
+        let mut tool_result = match (existing_result, persistence) {
+            (Some(tool_result), _) => tool_result,
+            (None, Some(persistence)) => persistence
+                .load_tool_result(ToolResultKey::from_tool_call(tool_call))
+                .await
+                .map_err(AgentLoopError::ToolResultPersistence)?
+                .unwrap_or_else(|| ToolResult {
+                    id: tool_call.id.clone(),
+                    call_id: tool_call.call_id.clone(),
+                    content: ToolResultContent::from_tool_output(repair_message.to_string()),
+                }),
+            (None, None) => ToolResult {
+                id: tool_call.id.clone(),
+                call_id: tool_call.call_id.clone(),
+                content: ToolResultContent::from_tool_output(repair_message.to_string()),
+            },
+        };
+
+        tool_result.id = tool_call.id.clone();
+        if tool_result.call_id.is_none() {
+            tool_result.call_id = tool_call.call_id.clone();
+        }
+        repaired.push(UserContent::ToolResult(tool_result));
+    }
+
+    Ok(repaired)
+}
+
 fn repair_tool_result_message(ids: &[String], repair_message: &str) -> Message {
     Message::User {
         content: OneOrMany::many(repair_tool_result_contents(ids, repair_message))
@@ -1709,6 +1950,16 @@ fn assistant_tool_call_ids(content: &OneOrMany<AssistantContent>) -> Vec<String>
         .iter()
         .filter_map(|item| match item {
             AssistantContent::ToolCall(tool_call) => Some(tool_call.id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn assistant_tool_calls(content: &OneOrMany<AssistantContent>) -> Vec<ToolCall> {
+    content
+        .iter()
+        .filter_map(|item| match item {
+            AssistantContent::ToolCall(tool_call) => Some(tool_call.clone()),
             _ => None,
         })
         .collect()
@@ -1900,7 +2151,10 @@ mod tests {
         test_utils::{MockAddTool, MockCompletionModel, MockResponse, MockStreamEvent},
         tool::Tool,
     };
-    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex, atomic::AtomicBool},
+    };
     use tokio::{
         sync::Notify,
         time::{Duration, sleep, timeout},
@@ -2047,6 +2301,234 @@ mod tests {
             tool_result_texts(requests[0].chat_history.iter()),
             vec!["custom recovery message"]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incremental_tool_result_persistence_records_completed_results() {
+        let model = MockCompletionModel::from_stream_turns([
+            vec![MockStreamEvent::tool_call(
+                "call_1",
+                "add",
+                serde_json::json!({"x": 1, "y": 2}),
+            )],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let persistence = MemoryToolResultPersistence::default();
+        let agent = AgentBuilder::new(model.clone()).tool(MockAddTool).build();
+        let agent_loop =
+            AgentLoop::new(agent).with_incremental_tool_result_persistence(persistence.clone());
+
+        let result = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .unwrap();
+
+        assert_eq!(result.end_reason, EndReason::Idle);
+        assert_eq!(model.request_count(), 2);
+        let persisted = persistence
+            .result(ToolResultKey::new("call_1", None))
+            .expect("tool result should be persisted as soon as it completes");
+        assert_eq!(persisted.id, "call_1");
+        assert_eq!(tool_result_text(&persisted).as_deref(), Some("3"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unanswered_tool_call_repair_prefers_persisted_tool_results() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("recovered"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let persistence = MemoryToolResultPersistence::default();
+        persistence.insert(
+            ToolResultKey::new("call_1", None),
+            test_tool_result_with_text("call_1", "persisted result"),
+        );
+        let agent = AgentBuilder::new(model.clone()).build();
+        let history = vec![Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![
+                AssistantContent::ToolCall(test_tool_call("call_1")),
+                AssistantContent::ToolCall(test_tool_call("call_2")),
+            ])
+            .unwrap(),
+        }];
+        let agent_loop = AgentLoop::new(agent)
+            .with_history(history)
+            .with_incremental_tool_result_persistence(persistence);
+
+        let result = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .unwrap();
+
+        validate_message_history(&result.history).unwrap();
+        assert_eq!(model.request_count(), 1);
+        let requests = model.requests();
+        assert_eq!(
+            tool_result_texts(requests[0].chat_history.iter()),
+            vec!["persisted result", DEFAULT_TOOL_REPAIR_MESSAGE]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unanswered_tool_call_repair_uses_provider_call_id_key() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("recovered"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let persistence = MemoryToolResultPersistence::default();
+        persistence.insert(
+            ToolResultKey::new("call_1", Some("provider_call_1".to_string())),
+            test_tool_result_with_text("call_1", "persisted with call id"),
+        );
+        let agent = AgentBuilder::new(model.clone()).build();
+        let history = vec![Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(
+                test_tool_call("call_1").with_call_id("provider_call_1".to_string()),
+            )),
+        }];
+        let agent_loop = AgentLoop::new(agent)
+            .with_history(history)
+            .with_incremental_tool_result_persistence(persistence);
+
+        agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .unwrap();
+
+        assert_eq!(model.request_count(), 1);
+        let requests = model.requests();
+        let repaired_results = tool_results(requests[0].chat_history.iter());
+        assert_eq!(repaired_results.len(), 1);
+        assert_eq!(repaired_results[0].id, "call_1");
+        assert_eq!(
+            repaired_results[0].call_id.as_deref(),
+            Some("provider_call_1")
+        );
+        assert_eq!(
+            tool_result_text(&repaired_results[0]).as_deref(),
+            Some("persisted with call id")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unanswered_tool_call_repair_merges_persisted_results_into_partial_tool_batch() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("recovered"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let persistence = MemoryToolResultPersistence::default();
+        persistence.insert(
+            ToolResultKey::new("call_1", None),
+            test_tool_result_with_text("call_1", "persisted first"),
+        );
+        let agent = AgentBuilder::new(model.clone()).build();
+        let history = vec![
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::many(vec![
+                    AssistantContent::ToolCall(test_tool_call("call_1")),
+                    AssistantContent::ToolCall(test_tool_call("call_2")),
+                ])
+                .unwrap(),
+            },
+            Message::User {
+                content: OneOrMany::one(UserContent::ToolResult(test_tool_result("call_2"))),
+            },
+        ];
+        let agent_loop = AgentLoop::new(agent)
+            .with_history(history)
+            .with_incremental_tool_result_persistence(persistence);
+
+        let result = agent_loop
+            .prompt(Message::user("start"))
+            .wait()
+            .await
+            .unwrap();
+
+        validate_message_history(&result.history).unwrap();
+        assert_eq!(model.request_count(), 1);
+        let requests = model.requests();
+        assert_eq!(
+            tool_result_texts(requests[0].chat_history.iter()),
+            vec!["persisted first", "echoed"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_result_persistence_load_error_stops_before_request() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::text("unused"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let persistence = MemoryToolResultPersistence::default();
+        persistence.fail_load();
+        let agent = AgentBuilder::new(model.clone()).build();
+        let agent_loop = AgentLoop::new(agent)
+            .with_history([assistant_tool_call_message("call_1")])
+            .with_incremental_tool_result_persistence(persistence);
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
+
+        let err = handle
+            .wait()
+            .await
+            .expect_err("load failures should fail startup repair");
+
+        assert!(matches!(err, AgentLoopError::ToolResultPersistence(_)));
+        assert_eq!(model.request_count(), 0);
+        let events = drain_events(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentLoopEvent::LoopFailed { error }
+                    if error.message.contains("tool result persistence failed: load failed")
+            )
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_result_persistence_persist_error_stops_loop() {
+        let model = MockCompletionModel::from_stream_turns([[MockStreamEvent::tool_call(
+            "call_1",
+            "add",
+            serde_json::json!({"x": 1, "y": 2}),
+        )]]);
+        let persistence = MemoryToolResultPersistence::default();
+        persistence.fail_persist();
+        let agent = AgentBuilder::new(model.clone()).tool(MockAddTool).build();
+        let agent_loop =
+            AgentLoop::new(agent).with_incremental_tool_result_persistence(persistence.clone());
+        let handle = agent_loop.prompt(Message::user("start"));
+        let mut events = handle.subscribe();
+
+        let err = handle
+            .wait()
+            .await
+            .expect_err("persist failures should fail the active turn");
+
+        assert!(matches!(err, AgentLoopError::ToolResultPersistence(_)));
+        assert_eq!(model.request_count(), 1);
+        assert!(
+            persistence
+                .result(ToolResultKey::new("call_1", None))
+                .is_none()
+        );
+        let events = drain_events(&mut events);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentLoopEvent::LoopFailed { error }
+                    if error.message.contains("tool result persistence failed: persist failed")
+            )
+        }));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3392,6 +3874,35 @@ mod tests {
             .collect()
     }
 
+    fn tool_results<'a>(messages: impl IntoIterator<Item = &'a Message>) -> Vec<ToolResult> {
+        messages
+            .into_iter()
+            .flat_map(|message| {
+                let Message::User { content } = message else {
+                    return Vec::new();
+                };
+
+                content
+                    .iter()
+                    .filter_map(|item| match item {
+                        UserContent::ToolResult(tool_result) => Some(tool_result.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn tool_result_text(tool_result: &ToolResult) -> Option<String> {
+        tool_result
+            .content
+            .iter()
+            .find_map(|content| match content {
+                ToolResultContent::Text(text) => Some(text.text.clone()),
+                ToolResultContent::Image(_) => None,
+            })
+    }
+
     fn first_user_text(message: &Message) -> Option<String> {
         let Message::User { content } = message else {
             return None;
@@ -3418,10 +3929,77 @@ mod tests {
     }
 
     fn test_tool_result(id: &str) -> ToolResult {
+        test_tool_result_with_text(id, "echoed")
+    }
+
+    fn test_tool_result_with_text(id: &str, text: &str) -> ToolResult {
         ToolResult {
             id: id.to_string(),
             call_id: None,
-            content: rig::message::ToolResultContent::from_tool_output("echoed".to_string()),
+            content: rig::message::ToolResultContent::from_tool_output(text.to_string()),
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct MemoryToolResultPersistence {
+        results: Arc<Mutex<BTreeMap<ToolResultKey, ToolResult>>>,
+        fail_persist: Arc<AtomicBool>,
+        fail_load: Arc<AtomicBool>,
+    }
+
+    impl MemoryToolResultPersistence {
+        fn insert(&self, key: ToolResultKey, result: ToolResult) {
+            self.results.lock().unwrap().insert(key, result);
+        }
+
+        fn result(&self, key: ToolResultKey) -> Option<ToolResult> {
+            self.results.lock().unwrap().get(&key).cloned()
+        }
+
+        fn fail_persist(&self) {
+            self.fail_persist
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn fail_load(&self) {
+            self.fail_load
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl IncrementalToolResultPersistence for MemoryToolResultPersistence {
+        fn persist_tool_result(
+            &self,
+            key: ToolResultKey,
+            result: ToolResult,
+        ) -> ToolResultPersistenceFuture<()> {
+            let results = self.results.clone();
+            let fail_persist = self.fail_persist.clone();
+            Box::pin(async move {
+                if fail_persist.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(Box::new(std::io::Error::other("persist failed"))
+                        as ToolResultPersistenceError);
+                }
+
+                results.lock().unwrap().insert(key, result);
+                Ok(())
+            })
+        }
+
+        fn load_tool_result(
+            &self,
+            key: ToolResultKey,
+        ) -> ToolResultPersistenceFuture<Option<ToolResult>> {
+            let results = self.results.clone();
+            let fail_load = self.fail_load.clone();
+            Box::pin(async move {
+                if fail_load.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(Box::new(std::io::Error::other("load failed"))
+                        as ToolResultPersistenceError);
+                }
+
+                Ok(results.lock().unwrap().get(&key).cloned())
+            })
         }
     }
 
@@ -3532,6 +4110,8 @@ mod tests {
             loop_timeout: None,
             turn_hook: None,
             assistant_message_hook: None,
+            unanswered_tool_call_repair: Some(DEFAULT_TOOL_REPAIR_MESSAGE.to_string()),
+            tool_result_persistence: None,
             events_tx,
             state,
             turn_running: Arc::new(AtomicBool::new(false)),
