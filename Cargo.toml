@@ -1,6 +1,6 @@
 [package]
 name = "rigloop"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "A small agent loop harness for Rig."
 license = "MIT OR Apache-2.0"
