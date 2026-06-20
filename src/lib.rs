@@ -41,7 +41,7 @@ type AssistantMessageHook<S> =
 type SharedMessages = Arc<Mutex<Vec<Message>>>;
 type SharedTurnRunning = Arc<AtomicBool>;
 const EVENT_BUFFER_SIZE: usize = 1024;
-const DEFAULT_TOOL_CRASH_MESSAGE: &str = "tool crashed before a result returned";
+const DEFAULT_TOOL_REPAIR_MESSAGE: &str = "Recovery message: no result was recorded for this tool call. It may or may not have completed.";
 
 fn lock_messages(messages: &SharedMessages) -> MutexGuard<'_, Vec<Message>> {
     match messages.lock() {
@@ -82,7 +82,7 @@ where
             initial_history: Vec::new(),
             turn_hook: None,
             assistant_message_hook: None,
-            unanswered_tool_call_repair: Some(DEFAULT_TOOL_CRASH_MESSAGE.to_string()),
+            unanswered_tool_call_repair: Some(DEFAULT_TOOL_REPAIR_MESSAGE.to_string()),
         }
     }
 }
@@ -2021,7 +2021,7 @@ mod tests {
         let requests = model.requests();
         assert_eq!(
             tool_result_texts(requests[0].chat_history.iter()),
-            vec![DEFAULT_TOOL_CRASH_MESSAGE]
+            vec![DEFAULT_TOOL_REPAIR_MESSAGE]
         );
     }
 
@@ -2034,7 +2034,7 @@ mod tests {
         let agent = AgentBuilder::new(model.clone()).build();
         let agent_loop = AgentLoop::new(agent)
             .with_history([assistant_tool_call_message("call_1")])
-            .with_unanswered_tool_call_repair_message("custom tool crash message");
+            .with_unanswered_tool_call_repair_message("custom recovery message");
 
         agent_loop
             .prompt(Message::user("start"))
@@ -2045,7 +2045,7 @@ mod tests {
         let requests = model.requests();
         assert_eq!(
             tool_result_texts(requests[0].chat_history.iter()),
-            vec!["custom tool crash message"]
+            vec!["custom recovery message"]
         );
     }
 
@@ -2659,7 +2659,7 @@ mod tests {
         validate_message_history(&result.history).unwrap();
         assert_eq!(
             tool_result_texts(result.history.iter()),
-            vec![DEFAULT_TOOL_CRASH_MESSAGE]
+            vec![DEFAULT_TOOL_REPAIR_MESSAGE]
         );
         assert_eq!(
             assistant_texts(result.history.iter()),
@@ -2670,7 +2670,7 @@ mod tests {
         let requests = recovery_model.requests();
         assert_eq!(
             tool_result_texts(requests[0].chat_history.iter()),
-            vec![DEFAULT_TOOL_CRASH_MESSAGE]
+            vec![DEFAULT_TOOL_REPAIR_MESSAGE]
         );
         let tool_call_ids = requests[0]
             .chat_history

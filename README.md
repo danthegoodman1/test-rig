@@ -156,7 +156,7 @@ For tool-call turns, the hook future is polled while Rig continues tool
 execution, then awaited before later commit/error boundaries.
 If the snapshot contains tool calls, it is not yet valid provider history until
 matching tool results exist. Rigloop repairs loaded histories with unanswered
-assistant tool calls by inserting synthetic failed tool results before
+assistant tool calls by inserting synthetic recovery tool results before
 validation. Override that synthetic result text with
 `with_unanswered_tool_call_repair_message(...)`.
 
@@ -206,7 +206,7 @@ can be sent to a provider.
 
 Histories loaded from partial assistant-message persistence are repaired by
 default when an assistant tool call is missing a matching tool result. Rigloop
-inserts a failed tool result that says `tool crashed before a result returned`;
+inserts a recovery tool result that says `Recovery message: no result was recorded for this tool call. It may or may not have completed.`;
 other invalid message ordering still fails validation.
 
 ## End Reasons
