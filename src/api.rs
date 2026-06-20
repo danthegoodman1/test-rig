@@ -12,7 +12,7 @@ use std::{
 
 use rig::{
     agent::{Agent, MultiTurnStreamItem, PromptHook, StreamingError},
-    completion::{CompletionModel, GetTokenUsage},
+    completion::{CompletionModel, GetTokenUsage, Usage},
     message::{Message, ToolCall, ToolResult},
     wasm_compat::WasmCompatSend,
 };
@@ -42,6 +42,12 @@ pub type ToolResultPersistenceFuture<T> =
 pub(crate) type SharedMessages = Arc<Mutex<Vec<Message>>>;
 pub(crate) type SharedTurnRunning = Arc<AtomicBool>;
 pub(crate) const EVENT_BUFFER_SIZE: usize = 1024;
+
+/// Default multi-turn tool-call budget for an agent run.
+///
+/// This is intentionally high enough to stay out of the way for normal agent
+/// loops, while remaining finite because Rig performs arithmetic on the limit.
+pub const DEFAULT_MAX_TURNS: usize = 1_000_000;
 
 /// Default synthetic tool-result text used to repair unanswered assistant tool calls.
 pub const DEFAULT_UNANSWERED_TOOL_CALL_REPAIR_MESSAGE: &str = "Recovery message: no result was recorded for this tool call. It may or may not have completed.";
@@ -159,7 +165,7 @@ where
         Self {
             agent: Arc::new(agent),
             app_state: Arc::new(()),
-            max_turns: 100,
+            max_turns: DEFAULT_MAX_TURNS,
             turn_timeout: None,
             loop_timeout: None,
             initial_history: Vec::new(),
@@ -245,7 +251,7 @@ where
     }
 
     /// Persist each completed tool result and use those results during startup repair.
-    pub(crate) fn with_incremental_tool_result_persistence(
+    pub fn with_incremental_tool_result_persistence(
         mut self,
         persistence: impl IncrementalToolResultPersistence,
     ) -> Self {
@@ -258,7 +264,7 @@ where
     /// When the assistant message contains tool calls, `context.new_messages`
     /// is not provider-valid until matching user tool results are appended or
     /// recovered by the default unanswered-tool-call history repair.
-    pub(crate) fn on_assistant_message_finished<F, Fut, E>(mut self, hook: F) -> Self
+    pub fn on_assistant_message_finished<F, Fut, E>(mut self, hook: F) -> Self
     where
         F: Fn(Arc<S>, AssistantMessageContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), E>> + Send + 'static,
@@ -282,7 +288,7 @@ where
     /// only the ordered append batch from this boundary. For interrupted turns,
     /// the append batch contains only completed tool-call/tool-result
     /// roundtrips. The hook is still called when the append batch is empty.
-    pub(crate) fn with_turn_hook<F, Fut, E>(mut self, hook: F) -> Self
+    pub fn with_turn_hook<F, Fut, E>(mut self, hook: F) -> Self
     where
         F: Fn(Arc<S>, TurnHookContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<TurnHookAction, E>> + Send + 'static,
@@ -580,6 +586,14 @@ pub struct TurnHookContext {
     pub history: Vec<Message>,
     /// The ordered messages generated at this turn boundary. This can be empty.
     pub new_messages: Vec<Message>,
+    /// The expected terminal reason for this loop, if this boundary is expected
+    /// to end the current run. `None` means more work is already queued or the
+    /// loop cannot yet prove it is ending.
+    pub end_reason: Option<EndReason>,
+    /// Aggregated provider usage for the completed turn when available.
+    ///
+    /// Providers may omit usage; in that case this is `None`.
+    pub usage: Option<Usage>,
 }
 
 #[derive(Clone, Debug)]
@@ -593,6 +607,17 @@ pub struct AssistantMessageContext {
     pub history: Vec<Message>,
     /// The ordered partial append batch ending with `message`.
     pub new_messages: Vec<Message>,
+    /// The expected terminal reason for this loop, if this assistant message is
+    /// expected to be part of the final committed boundary for the current run.
+    /// `None` means the turn is still active, more work is already queued, or
+    /// the loop cannot yet prove it is ending.
+    pub end_reason: Option<EndReason>,
+    /// Aggregated provider usage for the completed turn when available.
+    ///
+    /// This is only set for assistant snapshots emitted from a final response.
+    /// Earlier snapshots, such as assistant tool-call messages, do not have usage
+    /// yet. Providers may also omit usage.
+    pub usage: Option<Usage>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -604,6 +629,11 @@ pub enum TurnHookAction {
     ReplaceHistory(Vec<Message>),
     /// Keep `TurnHookContext::history`, then stop the loop.
     Abort { reason: String },
+    /// Replace the loop's active history, then stop the loop.
+    ReplaceHistoryAndAbort {
+        history: Vec<Message>,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug)]

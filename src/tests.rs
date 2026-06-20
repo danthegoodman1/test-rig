@@ -5,6 +5,7 @@ use rig::{
     agent::MultiTurnStreamItem,
     completion::{
         CompletionError, CompletionModel, CompletionRequest, CompletionResponse, ToolDefinition,
+        Usage,
     },
     message::{AssistantContent, Message, ToolCall, ToolResult, ToolResultContent, UserContent},
     streaming::{
@@ -1334,7 +1335,13 @@ async fn recovered_history_must_extend_committed_base() {
         vec![Message::user("start"), Message::assistant("different")],
     ] {
         let err = runner
-            .commit_recovered_history(&base, recovered_history)
+            .commit_recovered_history(
+                &base,
+                recovered_history,
+                EndReason::Other {
+                    message: "recovered".to_string(),
+                },
+            )
             .await
             .expect_err("non-appendable recovered history should fail");
         assert!(matches!(err, AgentLoopError::InvalidMessageHistory(_)));
@@ -2080,26 +2087,48 @@ async fn durable_harness_restarts_from_partial_assistant_snapshot_with_kv_repair
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn durable_harness_runs_observers_after_persistence() {
+async fn durable_harness_runs_checkpoint_handler_after_persistence() {
+    let usage = Usage {
+        input_tokens: 123,
+        output_tokens: 45,
+        total_tokens: 168,
+        ..Usage::new()
+    };
     let model = MockCompletionModel::from_stream_turns([[
         MockStreamEvent::text("done"),
-        MockStreamEvent::final_response_with_default_usage(),
+        MockStreamEvent::final_response(usage),
     ]]);
     let store = MemoryDurableAgentStore::default();
     let seen_persisted_lengths = Arc::new(Mutex::new(Vec::new()));
-    let observer_lengths = seen_persisted_lengths.clone();
-    let observer_store = store.clone();
+    let seen_end_reasons = Arc::new(Mutex::new(Vec::new()));
+    let seen_usage = Arc::new(Mutex::new(Vec::new()));
+    let handler_lengths = seen_persisted_lengths.clone();
+    let handler_end_reasons = seen_end_reasons.clone();
+    let handler_usage = seen_usage.clone();
+    let handler_store = store.clone();
     let agent = AgentBuilder::new(model).build();
     let harness =
-        DurableAgentHarness::new(agent, store.clone()).on_turn_committed_observer(move |_turn| {
-            let observer_store = observer_store.clone();
-            let observer_lengths = observer_lengths.clone();
+        DurableAgentHarness::new(agent, store.clone()).with_checkpoint_handler(move |checkpoint| {
+            let handler_store = handler_store.clone();
+            let handler_lengths = handler_lengths.clone();
+            let handler_end_reasons = handler_end_reasons.clone();
+            let handler_usage = handler_usage.clone();
             async move {
-                observer_lengths
-                    .lock()
-                    .unwrap()
-                    .push(observer_store.snapshot().persisted.len());
-                Ok::<_, std::convert::Infallible>(())
+                match checkpoint {
+                    DurableCheckpoint::AssistantMessageFinished(context) => {
+                        handler_end_reasons.lock().unwrap().push(context.end_reason);
+                        handler_usage.lock().unwrap().push(context.usage);
+                    }
+                    DurableCheckpoint::TurnBoundary(turn) => {
+                        handler_lengths
+                            .lock()
+                            .unwrap()
+                            .push(handler_store.snapshot().persisted.len());
+                        handler_end_reasons.lock().unwrap().push(turn.end_reason);
+                        handler_usage.lock().unwrap().push(turn.usage);
+                    }
+                }
+                Ok::<_, std::convert::Infallible>(DurableCheckpointAction::Continue)
             }
         });
 
@@ -2111,6 +2140,55 @@ async fn durable_harness_runs_observers_after_persistence() {
         .unwrap();
 
     assert_eq!(&seen_persisted_lengths.lock().unwrap()[..], &[2]);
+    assert_eq!(
+        &seen_end_reasons.lock().unwrap()[..],
+        &[Some(EndReason::Idle), Some(EndReason::Idle)]
+    );
+    assert_eq!(&seen_usage.lock().unwrap()[..], &[Some(usage), Some(usage)]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_harness_checkpoint_handler_can_abort_after_assistant_snapshot() {
+    let model = MockCompletionModel::from_stream_turns([[
+        MockStreamEvent::text("summary-worthy answer"),
+        MockStreamEvent::final_response_with_default_usage(),
+    ]]);
+    let store = MemoryDurableAgentStore::default();
+    let compaction_required = Arc::new(AtomicBool::new(false));
+    let agent = AgentBuilder::new(model).build();
+    let harness = DurableAgentHarness::new(agent, store.clone());
+    let handler_flag = compaction_required.clone();
+    let harness = harness.with_checkpoint_handler(move |checkpoint| {
+        let handler_flag = handler_flag.clone();
+        async move {
+            if matches!(checkpoint, DurableCheckpoint::AssistantMessageFinished(_)) {
+                handler_flag.store(true, Ordering::SeqCst);
+                return Ok::<_, DurableAgentError>(DurableCheckpointAction::Abort {
+                    reason: "compaction requested".to_string(),
+                });
+            }
+            Ok(DurableCheckpointAction::Continue)
+        }
+    });
+
+    let start = harness.follow_up("start").await.unwrap();
+    harness.start().unwrap();
+    let end_reason = timeout(Duration::from_secs(1), harness.wait_for_idle())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        end_reason,
+        EndReason::AbortedByHook { reason } if reason == "compaction requested"
+    ));
+    assert!(compaction_required.load(Ordering::SeqCst));
+    let state = store.snapshot();
+    assert_eq!(
+        assistant_texts(state.persisted.iter()),
+        vec!["summary-worthy answer"]
+    );
+    assert_eq!(state.acked_inbox_ids, vec![start.id]);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2139,35 +2217,39 @@ async fn durable_harness_submit_failure_does_not_signal_agent() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn durable_harness_remembers_observer_failure_for_later_wait() {
+async fn durable_harness_remembers_checkpoint_handler_failure_for_later_wait() {
     let model = MockCompletionModel::from_stream_turns([[
         MockStreamEvent::text("done"),
         MockStreamEvent::final_response_with_default_usage(),
     ]]);
     let store = MemoryDurableAgentStore::default();
-    let observer_started = Arc::new(Notify::new());
-    let observer_notify = observer_started.clone();
+    let handler_started = Arc::new(Notify::new());
+    let handler_notify = handler_started.clone();
     let agent = AgentBuilder::new(model.clone()).build();
-    let harness = DurableAgentHarness::new(agent, store).on_turn_committed_observer(move |_turn| {
-        let observer_notify = observer_notify.clone();
-        async move {
-            observer_notify.notify_one();
-            Err::<(), _>(std::io::Error::other("observer failed"))
-        }
-    });
+    let harness =
+        DurableAgentHarness::new(agent, store).with_checkpoint_handler(move |checkpoint| {
+            let handler_notify = handler_notify.clone();
+            async move {
+                if matches!(checkpoint, DurableCheckpoint::TurnBoundary(_)) {
+                    handler_notify.notify_one();
+                    return Err(std::io::Error::other("handler failed"));
+                }
+                Ok(DurableCheckpointAction::Continue)
+            }
+        });
 
     harness.follow_up("start").await.unwrap();
     harness.start().unwrap();
-    timeout(Duration::from_secs(1), observer_started.notified())
+    timeout(Duration::from_secs(1), handler_started.notified())
         .await
         .unwrap();
 
     let err = timeout(Duration::from_secs(1), harness.wait_for_idle())
         .await
         .unwrap()
-        .expect_err("observer failure should be remembered for later waiters");
+        .expect_err("checkpoint handler failure should be remembered for later waiters");
 
-    assert!(err.to_string().contains("observer failed"));
+    assert!(err.to_string().contains("handler failed"));
     assert_eq!(model.request_count(), 1);
 }
 
@@ -2647,7 +2729,7 @@ fn test_runner(
     Runner::new(RunnerInit {
         agent,
         app_state: Arc::new(()),
-        max_turns: 100,
+        max_turns: DEFAULT_MAX_TURNS,
         turn_timeout: None,
         loop_timeout: None,
         turn_hook: None,

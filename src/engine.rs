@@ -8,7 +8,7 @@ use std::{
 use futures::StreamExt;
 use rig::{
     agent::{Agent, MultiTurnStreamItem, PromptHook, StreamingError},
-    completion::{CompletionError, CompletionModel, GetTokenUsage, PromptError},
+    completion::{CompletionError, CompletionModel, GetTokenUsage, PromptError, Usage},
     message::{Message, ToolResult},
     streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt},
     wasm_compat::WasmCompatSend,
@@ -573,6 +573,7 @@ where
                                     &turn,
                                     &mut partial_turn,
                                     &mut assistant_message_hook,
+                                    commands_closed,
                                 )
                                 .await?
                             {
@@ -581,9 +582,14 @@ where
                         }
                         Err(err) => {
                             wait_for_assistant_message_hook(&mut assistant_message_hook).await?;
+                            let end_reason = end_reason_from_streaming_error(&err);
                             if let Some(history) = history_from_error(&err) {
                                 if let CommitOutcome::Abort(end_reason) = self
-                                    .commit_recovered_history(&turn.committed_base_history, history)
+                                    .commit_recovered_history(
+                                        &turn.committed_base_history,
+                                        history,
+                                        end_reason.clone(),
+                                    )
                                     .await?
                                 {
                                     return Ok(PromptAction::Finish(end_reason));
@@ -591,7 +597,7 @@ where
                             } else {
                                 self.set_turn_running(false);
                             }
-                            return Ok(PromptAction::Finish(end_reason_from_streaming_error(&err)));
+                            return Ok(PromptAction::Finish(end_reason));
                         }
                     }
                 }
@@ -638,8 +644,19 @@ where
         deadline: TimeoutDeadline,
     ) -> Result<PromptAction, AgentLoopError> {
         let messages = turn.partial_messages(partial_turn);
-        self.commit_append(messages, CommitEvent::TimedOut).await?;
-        Ok(PromptAction::Finish(deadline.end_reason()))
+        let end_reason = deadline.end_reason();
+        if let CommitOutcome::Abort(end_reason) = self
+            .commit_append(
+                messages,
+                CommitEvent::TimedOut {
+                    end_reason: end_reason.clone(),
+                },
+            )
+            .await?
+        {
+            return Ok(PromptAction::Finish(end_reason));
+        }
+        Ok(PromptAction::Finish(end_reason))
     }
 
     async fn handle_stream_item(
@@ -648,14 +665,21 @@ where
         turn: &PreparedTurn,
         partial_turn: &mut PartialTurn,
         assistant_message_hook: &mut Option<AssistantMessageHookTask>,
+        commands_closed: bool,
     ) -> Result<Option<EndReason>, AgentLoopError> {
         match item {
             MultiTurnStreamItem::StreamAssistantItem(item) => {
                 let is_message_boundary = matches!(item, StreamedAssistantContent::ToolCall { .. });
                 partial_turn.note_assistant_item(item);
                 if is_message_boundary {
-                    self.start_assistant_message_hook(turn, partial_turn, assistant_message_hook)
-                        .await?;
+                    self.start_assistant_message_hook(
+                        turn,
+                        partial_turn,
+                        assistant_message_hook,
+                        None,
+                        None,
+                    )
+                    .await?;
                 }
             }
             MultiTurnStreamItem::StreamUserItem(item) => {
@@ -665,15 +689,26 @@ where
                 partial_turn.note_user_item(item);
             }
             MultiTurnStreamItem::FinalResponse(final_response) => {
-                self.start_assistant_message_hook(turn, partial_turn, assistant_message_hook)
-                    .await?;
+                let end_reason = self.projected_final_response_end_reason(commands_closed);
+                let usage = final_response.usage();
+                self.start_assistant_message_hook(
+                    turn,
+                    partial_turn,
+                    assistant_message_hook,
+                    end_reason.clone(),
+                    Some(usage),
+                )
+                .await?;
                 wait_for_assistant_message_hook(assistant_message_hook).await?;
                 self.last_response = Some(final_response.response().to_string());
                 if let Some(messages) = final_response.history()
                     && let CommitOutcome::Abort(end_reason) = self
                         .commit_append(
                             turn.append_messages(messages.to_vec()),
-                            CommitEvent::Committed,
+                            CommitEvent::Committed {
+                                end_reason,
+                                usage: Some(usage),
+                            },
                         )
                         .await?
                 {
@@ -685,6 +720,14 @@ where
         }
 
         Ok(None)
+    }
+
+    fn projected_final_response_end_reason(&self, commands_closed: bool) -> Option<EndReason> {
+        if self.has_pending_turn() || !(self.finish_when_idle || commands_closed) {
+            return None;
+        }
+
+        Some(EndReason::Idle)
     }
 
     async fn repair_initial_history(&mut self) -> Result<(), AgentLoopError> {
@@ -722,6 +765,8 @@ where
         turn: &PreparedTurn,
         partial_turn: &mut PartialTurn,
         assistant_message_hook: &mut Option<AssistantMessageHookTask>,
+        end_reason: Option<EndReason>,
+        usage: Option<Usage>,
     ) -> Result<(), AgentLoopError> {
         let Some(message) = partial_turn.assistant_message() else {
             return Ok(());
@@ -746,6 +791,8 @@ where
             message,
             history,
             new_messages: messages,
+            end_reason,
+            usage,
         };
         *assistant_message_hook = Some(AssistantMessageHookTask::spawn(hook(
             self.app_state.clone(),
@@ -771,6 +818,8 @@ where
             let turn = TurnHookContext {
                 history: next_history.clone(),
                 new_messages: messages.clone(),
+                end_reason: event.end_reason(),
+                usage: event.usage(),
             };
 
             match hook(self.app_state.clone(), turn)
@@ -785,6 +834,13 @@ where
                     replaced_history = Some(history);
                 }
                 TurnHookAction::Abort { reason } => {
+                    abort_reason = Some(reason);
+                }
+                TurnHookAction::ReplaceHistoryAndAbort { history, reason } => {
+                    validate_message_history(&history)
+                        .map_err(AgentLoopError::InvalidMessageHistory)?;
+                    next_history = history.clone();
+                    replaced_history = Some(history);
                     abort_reason = Some(reason);
                 }
             }
@@ -809,6 +865,7 @@ where
         &mut self,
         base_history: &[Message],
         recovered_history: Vec<Message>,
+        end_reason: EndReason,
     ) -> Result<CommitOutcome, AgentLoopError> {
         validate_message_history(&recovered_history)
             .map_err(AgentLoopError::InvalidMessageHistory)?;
@@ -822,7 +879,14 @@ where
         }
 
         let append = recovered_history[base_history.len()..].to_vec();
-        self.commit_append(append, CommitEvent::Committed).await
+        self.commit_append(
+            append,
+            CommitEvent::Committed {
+                end_reason: Some(end_reason),
+                usage: None,
+            },
+        )
+        .await
     }
 
     fn finish(&mut self, end_reason: EndReason) -> AgentLoopResult {
@@ -850,21 +914,42 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum CommitEvent {
-    Committed,
+    Committed {
+        end_reason: Option<EndReason>,
+        usage: Option<Usage>,
+    },
     Interrupted,
     Aborted,
-    TimedOut,
+    TimedOut {
+        end_reason: EndReason,
+    },
 }
 
 impl CommitEvent {
+    fn end_reason(&self) -> Option<EndReason> {
+        match self {
+            Self::Committed { end_reason, .. } => end_reason.clone(),
+            Self::Interrupted => None,
+            Self::Aborted => Some(EndReason::Aborted),
+            Self::TimedOut { end_reason } => Some(end_reason.clone()),
+        }
+    }
+
+    fn usage(&self) -> Option<Usage> {
+        match self {
+            Self::Committed { usage, .. } => *usage,
+            Self::Interrupted | Self::Aborted | Self::TimedOut { .. } => None,
+        }
+    }
+
     fn into_agent_event<R>(self, messages: Vec<Message>) -> AgentLoopEvent<R> {
         match self {
-            Self::Committed => AgentLoopEvent::TurnCommitted { messages },
+            Self::Committed { .. } => AgentLoopEvent::TurnCommitted { messages },
             Self::Interrupted => AgentLoopEvent::TurnInterrupted { messages },
             Self::Aborted => AgentLoopEvent::TurnAborted { messages },
-            Self::TimedOut => AgentLoopEvent::TurnTimedOut { messages },
+            Self::TimedOut { .. } => AgentLoopEvent::TurnTimedOut { messages },
         }
     }
 }

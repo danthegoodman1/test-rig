@@ -22,7 +22,7 @@ small amount of recovery needed around unanswered tool calls.
 - [Durable Signals](#durable-signals)
 - [Low-Level Engine](#low-level-engine)
 - [Timeouts](#timeouts)
-- [Events and Observers](#events-and-observers)
+- [Events and Checkpoints](#events-and-checkpoints)
 - [History and Repair](#history-and-repair)
 - [End Reasons](#end-reasons)
 - [Inspiration](#inspiration)
@@ -59,8 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `store` implements DurableAgentStore.
     let harness = DurableAgentHarness::new(agent, store)
-        .with_history(load_persisted_history().await?)
-        .max_turns(8);
+        .with_history(load_persisted_history().await?);
 
     harness.follow_up("Explain agent loops in one paragraph.").await?;
     harness.start()?;
@@ -71,6 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+`max_turns(...)` is optional. By default rigloop uses `DEFAULT_MAX_TURNS`
+(`1_000_000`) so long tool loops are not cut off by the harness unless you add
+your own guardrail.
 
 Once started, the harness owns the manager task. Later calls to `steer`,
 `follow_up`, or `interrupt` wake the manager automatically; callers do not call
@@ -198,25 +201,45 @@ Timeouts during an active turn commit only valid completed tool-call/tool-result
 pairs. Active-turn timeouts emit `AgentLoopEvent::TurnTimedOut`; loop timeouts
 while idle end the loop without an extra transcript commit.
 
-## Events and Observers
+## Events and Checkpoints
 
-On the managed harness, observer hooks run after rigloop's internal durability
-work. Observer errors fail the managed run and are returned from
+On the managed harness, checkpoint handlers run after rigloop's internal
+durability work. Handler errors fail the managed run and are returned from
 `wait_for_idle()`.
 
 ```rust
 let harness = DurableAgentHarness::new(agent, store)
-    .on_turn_committed_observer(|turn| async move {
-        println!("committed {} messages", turn.new_messages.len());
-        Ok::<_, std::convert::Infallible>(())
-    })
-    .on_assistant_message_finished_observer(|context| async move {
-        println!("assistant snapshot: {} messages", context.new_messages.len());
-        Ok::<_, std::convert::Infallible>(())
+    .with_checkpoint_handler(|checkpoint| async move {
+        match checkpoint {
+            rigloop::DurableCheckpoint::TurnBoundary(turn) => {
+                println!(
+                    "committed {} messages, input_tokens={:?}",
+                    turn.new_messages.len(),
+                    turn.usage.map(|usage| usage.input_tokens),
+                );
+            }
+            rigloop::DurableCheckpoint::AssistantMessageFinished(context) => {
+                println!(
+                    "assistant snapshot: {} messages, ending={}",
+                    context.new_messages.len(),
+                    context.end_reason.is_some(),
+                );
+            }
+        }
+
+        Ok::<_, std::convert::Infallible>(
+            rigloop::DurableCheckpointAction::Continue,
+        )
     });
 ```
 
-Use low-level event subscription when you need raw stream forwarding:
+Use `context.end_reason` or `turn.end_reason` to avoid maintenance work that is
+only useful before another turn. For compaction, prefer
+`DurableCheckpoint::TurnBoundary`; assistant snapshots are earlier recovery
+points and can temporarily contain unanswered tool calls.
+
+Use low-level event subscription, or `with_event_observer(...)` on the managed
+harness, when you need raw stream forwarding:
 
 ```rust
 let mut events = handle.subscribe();
@@ -297,7 +320,7 @@ Known end reasons include:
 | `Idle` | The prompt and all queued work completed. |
 | `NoRun` | A managed wait reached idle without starting or resuming an agent turn. |
 | `Aborted` | The caller aborted the loop. |
-| `AbortedByHook` | Internal commit plumbing stopped the loop. |
+| `AbortedByHook` | A turn hook or durable checkpoint handler stopped the loop after a commit boundary. |
 | `ContentFilter` | The provider refused or filtered the request/response. |
 | `ContextFull` | The provider rejected the request because the context was too large. |
 | `Length` | The provider stopped due to an output limit. |
