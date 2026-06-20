@@ -1,201 +1,108 @@
-//! Demonstrates ACKing a simulated durable inbox only after rigloop's
-//! persistence hook sees the submitted user message in committed history.
+//! Demonstrates the managed durable harness: submit durable signals, start the
+//! agent manager, then wait until queued work is idle.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use rig::{
-    OneOrMany,
     agent::AgentBuilder,
-    message::{Message, Text, UserContent},
+    message::{Message, ToolResult},
     test_utils::{MockCompletionModel, MockStreamEvent},
 };
-use rigloop::{AgentLoop, AgentLoopHandle, TurnHookAction};
-use serde_json::json;
+use rigloop::{
+    DurableAgentFuture, DurableAgentHarness, DurableAgentStore, DurableInboxEntry,
+    IncrementalToolResultPersistence, PersistMessagesArgs, ToolResultKey,
+};
 
-const INBOX_ID_KEY: &str = "demo_inbox_id";
-
-#[derive(Clone, Debug)]
-struct Inbox {
-    inner: Arc<Mutex<InboxState>>,
+#[derive(Clone, Debug, Default)]
+struct MemoryDurableStore {
+    inner: Arc<Mutex<MemoryDurableState>>,
 }
 
 #[derive(Debug, Default)]
-struct InboxState {
-    next_id: usize,
-    pending: Vec<Entry>,
-    acked: Vec<Entry>,
+struct MemoryDurableState {
+    inbox: Vec<DurableInboxEntry>,
+    acked_inbox_ids: Vec<String>,
     persisted: Vec<Message>,
+    tool_results: HashMap<ToolResultKey, ToolResult>,
 }
 
-#[derive(Clone, Debug)]
-struct Entry {
-    id: String,
-    text: String,
+impl IncrementalToolResultPersistence for MemoryDurableStore {
+    fn persist_tool_result(
+        &self,
+        key: ToolResultKey,
+        result: ToolResult,
+    ) -> DurableAgentFuture<()> {
+        let store = self.clone();
+        Box::pin(async move {
+            store.inner.lock().unwrap().tool_results.insert(key, result);
+            Ok(())
+        })
+    }
+
+    fn load_tool_result(&self, key: ToolResultKey) -> DurableAgentFuture<Option<ToolResult>> {
+        let store = self.clone();
+        Box::pin(async move { Ok(store.inner.lock().unwrap().tool_results.get(&key).cloned()) })
+    }
 }
 
-impl Inbox {
-    fn new() -> Self {
-        Self {
-            inner: Arc::default(),
-        }
+impl DurableAgentStore for MemoryDurableStore {
+    fn submit_inbox_entry(&self, entry: DurableInboxEntry) -> DurableAgentFuture<()> {
+        let store = self.clone();
+        Box::pin(async move {
+            println!("submit> kind={:?} id={}", entry.kind, entry.id);
+            store.inner.lock().unwrap().inbox.push(entry);
+            Ok(())
+        })
     }
 
-    fn steer<R>(
-        &self,
-        handle: &AgentLoopHandle<R>,
-        text: impl Into<String>,
-    ) -> anyhow::Result<Entry>
-    where
-        R: Clone,
-    {
-        let (entry, message) = self.enqueue(text);
-        handle.steer(message)?;
-        println!("submit> kind=steer id={} text={:?}", entry.id, entry.text);
-        Ok(entry)
-    }
-
-    fn follow_up<R>(
-        &self,
-        handle: &AgentLoopHandle<R>,
-        text: impl Into<String>,
-    ) -> anyhow::Result<Entry>
-    where
-        R: Clone,
-    {
-        let (entry, message) = self.enqueue(text);
-        handle.follow_up(message)?;
-        println!(
-            "submit> kind=follow_up id={} text={:?}",
-            entry.id, entry.text
-        );
-        Ok(entry)
-    }
-
-    fn enqueue(&self, text: impl Into<String>) -> (Entry, Message) {
-        let mut state = self.inner.lock().unwrap();
-        state.next_id += 1;
-
-        let entry = Entry {
-            id: format!("inbox-{}", state.next_id),
-            text: text.into(),
-        };
-        let message = tagged_user_message(&entry.id, &entry.text);
-        state.pending.push(entry.clone());
-        (entry, message)
-    }
-
-    fn checkpoint_from_history(&self, history: &[Message]) {
-        let mut state = self.inner.lock().unwrap();
-        let start = state.persisted.len();
-        assert!(
-            start <= history.len(),
-            "persisted cursor is ahead of candidate history"
-        );
-        let new_messages = &history[start..];
-
-        // In a real store, this is one transaction:
-        // slice unread history, append it, then ACK matching inbox rows.
-        println!(
-            "persist> history[{}..{}] ({} new messages)",
-            start,
-            history.len(),
-            new_messages.len()
-        );
-        state.persisted.extend(new_messages.iter().cloned());
-
-        for inbox_id in new_messages.iter().filter_map(inbox_id) {
-            let Some(index) = state.pending.iter().position(|entry| entry.id == inbox_id) else {
-                continue;
-            };
-            let entry = state.pending.remove(index);
-            println!("ack> id={} text={:?}", entry.id, entry.text);
-            state.acked.push(entry);
-        }
+    fn persist_messages_and_ack(&self, args: PersistMessagesArgs) -> DurableAgentFuture<()> {
+        let store = self.clone();
+        Box::pin(async move {
+            println!(
+                "persist> messages={} ack_ids={:?}",
+                args.messages.len(),
+                args.ack_inbox_entry_ids
+            );
+            let mut state = store.inner.lock().unwrap();
+            state.persisted.extend(args.messages);
+            state.acked_inbox_ids.extend(args.ack_inbox_entry_ids);
+            Ok(())
+        })
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let agent = AgentBuilder::new(scripted_model()).build();
-    let inbox = Inbox::new();
+    let store = MemoryDurableStore::default();
+    let harness = DurableAgentHarness::new(agent, store.clone());
 
-    let inbox_for_hook = inbox.clone();
-    let loop_ = AgentLoop::new(agent).with_turn_hook(move |_state, turn| {
-        let inbox = inbox_for_hook.clone();
-        async move {
-            inbox.checkpoint_from_history(&turn.history);
-            Ok::<_, std::convert::Infallible>(TurnHookAction::Continue)
-        }
-    });
+    let start = harness.follow_up("start").await?;
+    for index in 0..10 {
+        harness.steer(format!("steer-{index}")).await?;
+    }
+    for index in 0..3 {
+        harness.follow_up(format!("follow-up-{index}")).await?;
+    }
 
-    let handle = loop_.prompt(Message::user("start"));
+    harness.start()?;
+    let end_reason = harness.wait_for_idle().await?;
+    let state = store.inner.lock().unwrap();
 
-    let steer_entries: Vec<_> = (0..10)
-        .map(|index| inbox.steer(&handle, format!("steer-{index}")))
-        .collect::<Result<_, _>>()?;
-    let follow_up_entries: Vec<_> = (0..3)
-        .map(|index| inbox.follow_up(&handle, format!("follow-up-{index}")))
-        .collect::<Result<_, _>>()?;
+    assert!(state.acked_inbox_ids.contains(&start.id));
+    assert_eq!(state.inbox.len(), state.acked_inbox_ids.len());
 
-    let result = handle.wait().await?;
-    let state = inbox.inner.lock().unwrap();
-
-    assert!(state.pending.is_empty());
-    assert_eq!(
-        state
-            .acked
-            .iter()
-            .map(|entry| &entry.id)
-            .collect::<Vec<_>>(),
-        steer_entries
-            .iter()
-            .chain(follow_up_entries.iter())
-            .map(|entry| &entry.id)
-            .collect::<Vec<_>>()
-    );
-
-    println!("end_reason: {:?}", result.end_reason);
+    println!("end_reason: {:?}", end_reason);
     println!("persisted messages: {}", state.persisted.len());
-    println!(
-        "acked inbox rows: {:?}",
-        state
-            .acked
-            .iter()
-            .map(|entry| entry.id.as_str())
-            .collect::<Vec<_>>()
-    );
+    println!("acked inbox rows: {:?}", state.acked_inbox_ids);
 
     Ok(())
 }
 
-fn tagged_user_message(inbox_id: &str, text: &str) -> Message {
-    Message::User {
-        content: OneOrMany::one(UserContent::Text(Text {
-            text: text.to_string(),
-            additional_params: Some(json!({ INBOX_ID_KEY: inbox_id })),
-        })),
-    }
-}
-
-fn inbox_id(message: &Message) -> Option<String> {
-    let Message::User { content } = message else {
-        return None;
-    };
-
-    content.iter().find_map(|content| match content {
-        UserContent::Text(text) => text
-            .additional_params
-            .as_ref()?
-            .get(INBOX_ID_KEY)?
-            .as_str()
-            .map(ToOwned::to_owned),
-        _ => None,
-    })
-}
-
 fn scripted_model() -> MockCompletionModel {
-    // Extra turns keep the example deterministic whether queued steers batch
-    // together immediately or drain across several loop turns.
     MockCompletionModel::from_stream_turns((0..32).map(|index| {
         vec![
             MockStreamEvent::text(format!("synthetic response {index}")),

@@ -12,6 +12,7 @@ categories = ["asynchronous"]
 [dependencies]
 futures = "0.3.32"
 rig = "0.38.2"
+serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
