@@ -44,7 +44,11 @@ pub type ToolResultPersistenceFuture<T> =
 type SharedMessages = Arc<Mutex<Vec<Message>>>;
 type SharedTurnRunning = Arc<AtomicBool>;
 const EVENT_BUFFER_SIZE: usize = 1024;
-const DEFAULT_TOOL_REPAIR_MESSAGE: &str = "Recovery message: no result was recorded for this tool call. It may or may not have completed.";
+
+/// Default synthetic tool-result text used to repair unanswered assistant tool calls.
+pub const DEFAULT_UNANSWERED_TOOL_CALL_REPAIR_MESSAGE: &str = "Recovery message: no result was recorded for this tool call. It may or may not have completed.";
+
+const DEFAULT_TOOL_REPAIR_MESSAGE: &str = DEFAULT_UNANSWERED_TOOL_CALL_REPAIR_MESSAGE;
 
 fn lock_messages(messages: &SharedMessages) -> MutexGuard<'_, Vec<Message>> {
     match messages.lock() {
@@ -1374,7 +1378,7 @@ where
         let repaired = repair_unanswered_tool_calls_with_persistence(
             self.history_snapshot(),
             repair_message,
-            self.tool_result_persistence.as_ref(),
+            self.tool_result_persistence.as_deref(),
         )
         .await?;
         *lock_messages(&self.state) = repaired;
@@ -1746,7 +1750,23 @@ fn validate_resume_history(messages: &[Message]) -> Result<(), InvalidMessageHis
     }
 }
 
-fn repair_unanswered_tool_calls(mut messages: Vec<Message>, repair_message: &str) -> Vec<Message> {
+/// Repair assistant tool-call messages that are missing matching user tool results.
+///
+/// The returned history preserves existing messages, inserts a synthetic user
+/// tool-result message after any unanswered assistant tool-call message, and
+/// adds missing tool results to partial result batches. Histories that are
+/// invalid for reasons other than unanswered tool calls are not normalized.
+pub fn repair_unanswered_tool_calls<H, T>(
+    history: H,
+    repair_message: impl AsRef<str>,
+) -> Vec<Message>
+where
+    H: IntoIterator<Item = T>,
+    T: Into<Message>,
+{
+    let mut messages = history.into_iter().map(Into::into).collect::<Vec<_>>();
+    let repair_message = repair_message.as_ref();
+
     let mut index = 0;
     while index < messages.len() {
         let expected_ids = match &messages[index] {
@@ -1810,11 +1830,23 @@ fn repair_unanswered_tool_calls(mut messages: Vec<Message>, repair_message: &str
     messages
 }
 
-async fn repair_unanswered_tool_calls_with_persistence(
-    mut messages: Vec<Message>,
-    repair_message: &str,
-    persistence: Option<&Arc<dyn IncrementalToolResultPersistence>>,
-) -> Result<Vec<Message>, AgentLoopError> {
+/// Repair unanswered assistant tool calls, preferring persisted tool results when available.
+///
+/// For each missing tool result, this first calls
+/// [`IncrementalToolResultPersistence::load_tool_result`]. If no persisted
+/// result exists, it falls back to the supplied synthetic repair text.
+pub async fn repair_unanswered_tool_calls_with_persistence<H, T>(
+    history: H,
+    repair_message: impl AsRef<str>,
+    persistence: Option<&dyn IncrementalToolResultPersistence>,
+) -> Result<Vec<Message>, AgentLoopError>
+where
+    H: IntoIterator<Item = T>,
+    T: Into<Message>,
+{
+    let mut messages = history.into_iter().map(Into::into).collect::<Vec<_>>();
+    let repair_message = repair_message.as_ref();
+
     let mut index = 0;
     while index < messages.len() {
         let expected_calls = match &messages[index] {
@@ -1882,7 +1914,7 @@ async fn repair_tool_result_content(
     existing_content: Vec<UserContent>,
     expected_calls: &[ToolCall],
     repair_message: &str,
-    persistence: Option<&Arc<dyn IncrementalToolResultPersistence>>,
+    persistence: Option<&dyn IncrementalToolResultPersistence>,
 ) -> Result<Vec<UserContent>, AgentLoopError> {
     let mut repaired = existing_content
         .iter()
@@ -2886,6 +2918,43 @@ mod tests {
         assert_eq!(
             tool_result_texts(repaired.iter()),
             vec!["echoed", "tool repaired"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repair_unanswered_tool_calls_with_persistence_prefers_recorded_results() {
+        let persistence = MemoryToolResultPersistence::default();
+        persistence.insert(
+            ToolResultKey::new("call_1", None),
+            test_tool_result_with_text("call_1", "persisted first"),
+        );
+        let history = vec![
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::many(vec![
+                    AssistantContent::ToolCall(test_tool_call("call_1")),
+                    AssistantContent::ToolCall(test_tool_call("call_2")),
+                    AssistantContent::ToolCall(test_tool_call("call_3")),
+                ])
+                .unwrap(),
+            },
+            Message::User {
+                content: OneOrMany::one(UserContent::ToolResult(test_tool_result("call_2"))),
+            },
+        ];
+
+        let repaired = repair_unanswered_tool_calls_with_persistence(
+            history,
+            "tool repaired",
+            Some(&persistence),
+        )
+        .await
+        .unwrap();
+
+        validate_message_history(&repaired).unwrap();
+        assert_eq!(
+            tool_result_texts(repaired.iter()),
+            vec!["persisted first", "echoed", "tool repaired"]
         );
     }
 

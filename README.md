@@ -209,6 +209,25 @@ default when an assistant tool call is missing a matching tool result. Rigloop
 inserts a recovery tool result that says `Recovery message: no result was recorded for this tool call. It may or may not have completed.`;
 other invalid message ordering still fails validation.
 
+Use the same repair logic directly when you need to normalize persisted history
+before handing it to another boundary:
+
+```rust
+use rigloop::{
+    repair_unanswered_tool_calls,
+    DEFAULT_UNANSWERED_TOOL_CALL_REPAIR_MESSAGE,
+};
+
+let repaired = repair_unanswered_tool_calls(
+    loaded_messages,
+    DEFAULT_UNANSWERED_TOOL_CALL_REPAIR_MESSAGE,
+);
+```
+
+If you record completed tool results separately, use
+`repair_unanswered_tool_calls_with_persistence(...)` so repair can restore those
+results before falling back to synthetic recovery text.
+
 ## End Reasons
 
 `AgentLoopResult` includes `end_reason`, `history`, and `last_response`.
