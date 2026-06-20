@@ -5,98 +5,26 @@
 //! already queued, it requests an abort; otherwise the application defers the
 //! rewrite until it actually decides to continue.
 
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use rig::{
     agent::AgentBuilder,
-    message::{AssistantContent, Message, ToolResult, UserContent},
+    message::{AssistantContent, Message, UserContent},
     test_utils::{MockCompletionModel, MockStreamEvent},
 };
 use rigloop::{
-    DurableAgentFuture, DurableAgentHarness, DurableAgentStore, DurableCheckpoint,
-    DurableCheckpointAction, DurableInboxEntry, EndReason, IncrementalToolResultPersistence,
-    PersistMessagesArgs, ToolResultKey,
+    DurableAgentHarness, DurableCheckpoint, DurableCheckpointAction, EndReason,
+    InMemoryDurableAgentStore,
 };
 
 const COMPACTION_INPUT_TOKEN_THRESHOLD: u64 = 100;
 
-#[derive(Clone, Debug, Default)]
-struct MemoryDurableStore {
-    inner: Arc<Mutex<MemoryDurableState>>,
-}
-
-#[derive(Debug, Default)]
-struct MemoryDurableState {
-    inbox: Vec<DurableInboxEntry>,
-    acked_inbox_ids: Vec<String>,
-    persisted: Vec<Message>,
-    tool_results: HashMap<ToolResultKey, ToolResult>,
-}
-
-impl MemoryDurableStore {
-    fn load_history(&self) -> Vec<Message> {
-        self.inner.lock().unwrap().persisted.clone()
-    }
-
-    fn replace_history(&self, history: Vec<Message>) {
-        self.inner.lock().unwrap().persisted = history;
-    }
-}
-
-impl IncrementalToolResultPersistence for MemoryDurableStore {
-    fn persist_tool_result(
-        &self,
-        key: ToolResultKey,
-        result: ToolResult,
-    ) -> DurableAgentFuture<()> {
-        let store = self.clone();
-        Box::pin(async move {
-            store.inner.lock().unwrap().tool_results.insert(key, result);
-            Ok(())
-        })
-    }
-
-    fn load_tool_result(&self, key: ToolResultKey) -> DurableAgentFuture<Option<ToolResult>> {
-        let store = self.clone();
-        Box::pin(async move { Ok(store.inner.lock().unwrap().tool_results.get(&key).cloned()) })
-    }
-}
-
-impl DurableAgentStore for MemoryDurableStore {
-    fn submit_inbox_entry(&self, entry: DurableInboxEntry) -> DurableAgentFuture<()> {
-        let store = self.clone();
-        Box::pin(async move {
-            println!("submit> kind={:?} id={}", entry.kind, entry.id);
-            store.inner.lock().unwrap().inbox.push(entry);
-            Ok(())
-        })
-    }
-
-    fn persist_messages_and_ack(&self, args: PersistMessagesArgs) -> DurableAgentFuture<()> {
-        let store = self.clone();
-        Box::pin(async move {
-            println!(
-                "persist> messages={} ack_ids={:?}",
-                args.messages.len(),
-                args.ack_inbox_entry_ids
-            );
-            let mut state = store.inner.lock().unwrap();
-            state.persisted.extend(args.messages);
-            state.acked_inbox_ids.extend(args.ack_inbox_entry_ids);
-            Ok(())
-        })
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let store = MemoryDurableStore::default();
+    let store = InMemoryDurableAgentStore::default();
     let compaction_recommended = Arc::new(AtomicBool::new(false));
     let agent = AgentBuilder::new(pre_compaction_model()).build();
     let handler_compaction_recommended = compaction_recommended.clone();

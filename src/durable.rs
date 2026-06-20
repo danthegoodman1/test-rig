@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fmt,
     future::Future,
@@ -15,7 +15,7 @@ use rig::{
     OneOrMany,
     agent::{Agent, PromptHook},
     completion::{CompletionModel, GetTokenUsage},
-    message::{AssistantContent, Message, Text, UserContent},
+    message::{AssistantContent, Message, Text, ToolResult, UserContent},
     wasm_compat::WasmCompatSend,
 };
 use serde_json::{Map, Value};
@@ -27,8 +27,9 @@ use tokio::{
 
 use super::{
     AgentLoop, AgentLoopError, AgentLoopEvent, AgentLoopHandle, AssistantMessageContext, Command,
-    EndReason, IncrementalToolResultPersistence, TurnHookAction, TurnHookContext,
-    repair_unanswered_tool_calls_with_persistence, validate_message_history,
+    EndReason, IncrementalToolResultPersistence, ToolResultKey, ToolResultPersistenceFuture,
+    TurnHookAction, TurnHookContext, repair_unanswered_tool_calls_with_persistence,
+    validate_message_history,
 };
 
 pub const INBOX_ENTRY_ID_PARAM: &str = "rigloop_inbox_entry_id";
@@ -102,6 +103,200 @@ pub trait DurableAgentStore: IncrementalToolResultPersistence {
     fn submit_inbox_entry(&self, entry: DurableInboxEntry) -> DurableAgentFuture<()>;
 
     fn persist_messages_and_ack(&self, args: PersistMessagesArgs) -> DurableAgentFuture<()>;
+}
+
+/// In-process durable store for examples, tests, and local prototypes.
+///
+/// This store implements the same append-and-ACK contract as a real
+/// [`DurableAgentStore`], but it is not durable across process restarts.
+#[derive(Clone, Debug, Default)]
+pub struct InMemoryDurableAgentStore {
+    inner: Arc<Mutex<InMemoryDurableAgentStoreState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct InMemoryDurableAgentStoreState {
+    submitted_inbox_entries: Vec<DurableInboxEntry>,
+    acked_inbox_entries: Vec<DurableInboxEntry>,
+    acked_inbox_ids: Vec<String>,
+    persisted_messages: Vec<Message>,
+    transactions: Vec<PersistMessagesArgs>,
+    tool_results: BTreeMap<ToolResultKey, ToolResult>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InMemoryDurableAgentStoreSnapshot {
+    pub submitted_inbox_entries: Vec<DurableInboxEntry>,
+    pub pending_inbox_entries: Vec<DurableInboxEntry>,
+    pub acked_inbox_entries: Vec<DurableInboxEntry>,
+    pub acked_inbox_ids: Vec<String>,
+    pub persisted_messages: Vec<Message>,
+    pub transactions: Vec<PersistMessagesArgs>,
+    pub tool_results: BTreeMap<ToolResultKey, ToolResult>,
+}
+
+impl InMemoryDurableAgentStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn snapshot(&self) -> InMemoryDurableAgentStoreSnapshot {
+        self.inner
+            .lock()
+            .expect("in-memory durable store poisoned")
+            .snapshot()
+    }
+
+    pub fn load_history(&self) -> Vec<Message> {
+        self.inner
+            .lock()
+            .expect("in-memory durable store poisoned")
+            .persisted_messages
+            .clone()
+    }
+
+    pub fn replace_history(&self, history: Vec<Message>) {
+        self.inner
+            .lock()
+            .expect("in-memory durable store poisoned")
+            .persisted_messages = history;
+    }
+
+    pub fn insert_tool_result(&self, key: ToolResultKey, result: ToolResult) -> Option<ToolResult> {
+        self.inner
+            .lock()
+            .expect("in-memory durable store poisoned")
+            .tool_results
+            .insert(key, result)
+    }
+}
+
+impl InMemoryDurableAgentStoreState {
+    fn snapshot(&self) -> InMemoryDurableAgentStoreSnapshot {
+        let acked_ids = self
+            .acked_inbox_entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<BTreeSet<_>>();
+        let pending_inbox_entries = self
+            .submitted_inbox_entries
+            .iter()
+            .filter(|entry| !acked_ids.contains(&entry.id))
+            .cloned()
+            .collect();
+
+        InMemoryDurableAgentStoreSnapshot {
+            submitted_inbox_entries: self.submitted_inbox_entries.clone(),
+            pending_inbox_entries,
+            acked_inbox_entries: self.acked_inbox_entries.clone(),
+            acked_inbox_ids: self.acked_inbox_ids.clone(),
+            persisted_messages: self.persisted_messages.clone(),
+            transactions: self.transactions.clone(),
+            tool_results: self.tool_results.clone(),
+        }
+    }
+}
+
+impl IncrementalToolResultPersistence for InMemoryDurableAgentStore {
+    fn persist_tool_result(
+        &self,
+        key: ToolResultKey,
+        result: ToolResult,
+    ) -> ToolResultPersistenceFuture<()> {
+        let store = self.clone();
+        Box::pin(async move {
+            store
+                .inner
+                .lock()
+                .expect("in-memory durable store poisoned")
+                .tool_results
+                .insert(key, result);
+            Ok(())
+        })
+    }
+
+    fn load_tool_result(
+        &self,
+        key: ToolResultKey,
+    ) -> ToolResultPersistenceFuture<Option<ToolResult>> {
+        let store = self.clone();
+        Box::pin(async move {
+            Ok(store
+                .inner
+                .lock()
+                .expect("in-memory durable store poisoned")
+                .tool_results
+                .get(&key)
+                .cloned())
+        })
+    }
+}
+
+impl DurableAgentStore for InMemoryDurableAgentStore {
+    fn submit_inbox_entry(&self, entry: DurableInboxEntry) -> DurableAgentFuture<()> {
+        let store = self.clone();
+        Box::pin(async move {
+            store
+                .inner
+                .lock()
+                .expect("in-memory durable store poisoned")
+                .submitted_inbox_entries
+                .push(entry);
+            Ok(())
+        })
+    }
+
+    fn persist_messages_and_ack(&self, args: PersistMessagesArgs) -> DurableAgentFuture<()> {
+        let store = self.clone();
+        Box::pin(async move {
+            let mut state = store
+                .inner
+                .lock()
+                .expect("in-memory durable store poisoned");
+            state.transactions.push(args.clone());
+            state
+                .acked_inbox_ids
+                .extend(args.ack_inbox_entry_ids.clone());
+
+            let mut already_acked = state
+                .acked_inbox_entries
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<BTreeSet<_>>();
+            for inbox_entry_id in &args.ack_inbox_entry_ids {
+                if already_acked.contains(inbox_entry_id) {
+                    continue;
+                }
+
+                if let Some(entry) = state
+                    .submitted_inbox_entries
+                    .iter()
+                    .find(|entry| &entry.id == inbox_entry_id)
+                {
+                    let mut entry = entry.clone();
+                    entry.status = DurableInboxStatus::Acked;
+                    already_acked.insert(entry.id.clone());
+                    state.acked_inbox_entries.push(entry);
+                }
+            }
+
+            for message in &args.messages {
+                if let Message::User { content } = message {
+                    for item in content.iter() {
+                        if let UserContent::ToolResult(tool_result) = item {
+                            state.tool_results.insert(
+                                ToolResultKey::from_tool_result(tool_result),
+                                tool_result.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+
+            state.persisted_messages.extend(args.messages);
+            Ok(())
+        })
+    }
 }
 
 #[derive(Debug)]

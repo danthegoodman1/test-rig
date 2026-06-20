@@ -16,8 +16,8 @@ pub use durable::{
     DurableAgentCallbackError, DurableAgentControl, DurableAgentError, DurableAgentFuture,
     DurableAgentHarness, DurableAgentStore, DurableAgentStoreError, DurableCheckpoint,
     DurableCheckpointAction, DurableInboxEntry, DurableInboxKind, DurableInboxStatus,
-    INBOX_ENTRY_ID_PARAM, PersistMessagesArgs, inbox_id_from_message, inbox_ids_from_messages,
-    tag_message_with_inbox_id,
+    INBOX_ENTRY_ID_PARAM, InMemoryDurableAgentStore, InMemoryDurableAgentStoreSnapshot,
+    PersistMessagesArgs, inbox_id_from_message, inbox_ids_from_messages, tag_message_with_inbox_id,
 };
 pub use history::{repair_unanswered_tool_calls, repair_unanswered_tool_calls_with_persistence};
 

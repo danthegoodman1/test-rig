@@ -44,10 +44,9 @@ long-lived agent session:
 ```rust
 use rig::{
     client::CompletionClient,
-    message::Message,
     providers::openai,
 };
-use rigloop::DurableAgentHarness;
+use rigloop::{DurableAgentHarness, InMemoryDurableAgentStore};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,9 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .preamble("You are concise and practical.")
         .build();
 
-    // `store` implements DurableAgentStore.
-    let harness = DurableAgentHarness::new(agent, store)
-        .with_history(load_persisted_history().await?);
+    // Use your own DurableAgentStore in production. The in-memory store is
+    // useful for tests, examples, and local prototypes.
+    let store = InMemoryDurableAgentStore::default();
+    let harness = DurableAgentHarness::new(agent, store);
 
     harness.follow_up("Explain agent loops in one paragraph.").await?;
     harness.start()?;
@@ -80,6 +80,8 @@ Once started, the harness owns the manager task. Later calls to `steer`,
 `start()` again.
 
 ```rust
+use rig::message::Message;
+
 harness.steer("Keep the next answer shorter.").await?;
 harness.follow_up(Message::user("Also give me a checklist.")).await?;
 harness.interrupt("Stop that and answer this instead.").await?;
@@ -110,6 +112,23 @@ impl DurableAgentStore for MyStore {
         // Atomically append transcript messages and ACK matching inbox rows.
     }
 }
+```
+
+For tests, examples, and local prototypes, `InMemoryDurableAgentStore` keeps
+the same append-and-ACK shape without the store boilerplate:
+
+```rust
+use rigloop::{DurableAgentHarness, InMemoryDurableAgentStore};
+
+let store = InMemoryDurableAgentStore::default();
+let harness = DurableAgentHarness::new(agent, store.clone());
+
+harness.follow_up("start").await?;
+harness.start()?;
+harness.wait_for_idle().await?;
+
+let snapshot = store.snapshot();
+assert!(snapshot.pending_inbox_entries.is_empty());
 ```
 
 See [examples/durable_inbox_ack.rs](examples/durable_inbox_ack.rs)

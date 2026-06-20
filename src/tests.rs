@@ -1701,6 +1701,49 @@ async fn durable_harness_wait_for_idle_reports_no_run_when_nothing_ran() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn in_memory_durable_store_tracks_pending_acks_and_tool_results() {
+    let store = InMemoryDurableAgentStore::default();
+    let message = tag_message_with_inbox_id(Message::user("start"), "inbox-1").unwrap();
+    let entry = DurableInboxEntry {
+        id: "inbox-1".to_string(),
+        kind: DurableInboxKind::FollowUp,
+        message: message.clone(),
+        status: DurableInboxStatus::Submitted,
+        submitted_at: tokio::time::Instant::now(),
+    };
+    let tool_result = test_tool_result("call_1");
+    let tool_result_message = Message::User {
+        content: OneOrMany::one(UserContent::ToolResult(tool_result.clone())),
+    };
+
+    store.submit_inbox_entry(entry).await.unwrap();
+    assert_eq!(store.snapshot().pending_inbox_entries.len(), 1);
+
+    store
+        .persist_messages_and_ack(PersistMessagesArgs {
+            messages: vec![message, tool_result_message],
+            ack_inbox_entry_ids: vec!["inbox-1".to_string()],
+        })
+        .await
+        .unwrap();
+
+    let snapshot = store.snapshot();
+    assert!(snapshot.pending_inbox_entries.is_empty());
+    assert_eq!(snapshot.acked_inbox_ids, vec!["inbox-1"]);
+    assert_eq!(
+        snapshot.acked_inbox_entries[0].status,
+        DurableInboxStatus::Acked
+    );
+    assert_eq!(snapshot.persisted_messages.len(), 2);
+    assert_eq!(
+        snapshot
+            .tool_results
+            .get(&ToolResultKey::new("call_1", None)),
+        Some(&tool_result)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn durable_harness_started_manager_wakes_for_later_signal() {
     let model = MockCompletionModel::from_stream_turns([[
         MockStreamEvent::text("late"),
