@@ -34,14 +34,16 @@ use super::{
 pub const INBOX_ENTRY_ID_PARAM: &str = "rigloop_inbox_entry_id";
 
 pub type DurableAgentStoreError = Box<dyn Error + Send + Sync + 'static>;
-pub type DurableAgentObserverError = Box<dyn Error + Send + Sync + 'static>;
+pub type DurableAgentCallbackError = Box<dyn Error + Send + Sync + 'static>;
 pub type DurableAgentFuture<T> =
     Pin<Box<dyn Future<Output = Result<T, DurableAgentStoreError>> + Send>>;
 
-type ObserverFuture = Pin<Box<dyn Future<Output = Result<(), DurableAgentObserverError>> + Send>>;
+type ObserverFuture = Pin<Box<dyn Future<Output = Result<(), DurableAgentCallbackError>> + Send>>;
 type EventObserver<R> = Arc<dyn Fn(AgentLoopEvent<R>) -> ObserverFuture + Send + Sync>;
-type AssistantObserver = Arc<dyn Fn(AssistantMessageContext) -> ObserverFuture + Send + Sync>;
-type TurnObserver = Arc<dyn Fn(TurnHookContext) -> ObserverFuture + Send + Sync>;
+type CheckpointFuture = Pin<
+    Box<dyn Future<Output = Result<DurableCheckpointAction, DurableAgentCallbackError>> + Send>,
+>;
+type CheckpointHandler = Arc<dyn Fn(DurableCheckpoint) -> CheckpointFuture + Send + Sync>;
 type InboxIdGenerator = Arc<dyn Fn(usize) -> String + Send + Sync>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +74,30 @@ pub struct PersistMessagesArgs {
     pub ack_inbox_entry_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+#[non_exhaustive]
+pub enum DurableCheckpoint {
+    /// A streamed assistant message is available and has been persisted.
+    ///
+    /// If the assistant message contains tool calls, this snapshot is not yet a
+    /// provider-valid replay history until matching tool results are appended or
+    /// repaired. Use this boundary for crash recovery and early observation.
+    AssistantMessageFinished(AssistantMessageContext),
+    /// A turn append boundary has been persisted.
+    ///
+    /// This history has passed provider-order validation. Prefer this boundary
+    /// for history maintenance work such as compaction.
+    TurnBoundary(TurnHookContext),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DurableCheckpointAction {
+    Continue,
+    Abort { reason: String },
+}
+
 pub trait DurableAgentStore: IncrementalToolResultPersistence {
     fn submit_inbox_entry(&self, entry: DurableInboxEntry) -> DurableAgentFuture<()>;
 
@@ -85,7 +111,7 @@ pub enum DurableAgentError {
     AlreadyStarted,
     NotStarted,
     Store(DurableAgentStoreError),
-    Observer(DurableAgentObserverError),
+    Callback(DurableAgentCallbackError),
     AgentLoop(AgentLoopError),
     TaskJoin(tokio::task::JoinError),
     ManagerFailed(String),
@@ -101,7 +127,7 @@ impl fmt::Display for DurableAgentError {
             Self::AlreadyStarted => f.write_str("durable agent is already started"),
             Self::NotStarted => f.write_str("durable agent has not been started"),
             Self::Store(err) => write!(f, "durable store failed: {err}"),
-            Self::Observer(err) => write!(f, "durable observer failed: {err}"),
+            Self::Callback(err) => write!(f, "durable callback failed: {err}"),
             Self::AgentLoop(err) => write!(f, "{err}"),
             Self::TaskJoin(err) => write!(f, "{err}"),
             Self::ManagerFailed(message) => write!(f, "durable manager failed: {message}"),
@@ -113,7 +139,7 @@ impl Error for DurableAgentError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Store(err) => Some(err.as_ref()),
-            Self::Observer(err) => Some(err.as_ref()),
+            Self::Callback(err) => Some(err.as_ref()),
             Self::AgentLoop(err) => Some(err),
             Self::TaskJoin(err) => Some(err),
             Self::InvalidSignalMessage(_)
@@ -144,11 +170,25 @@ struct QueuedSignal {
 }
 
 enum ManagerCommand {
-    Signal(QueuedSignal),
+    Signal(Box<QueuedSignal>),
+    Abort,
     Wait(oneshot::Sender<Result<EndReason, DurableAgentError>>),
 }
 
-struct DurableCheckpoint<D, R>
+#[derive(Clone)]
+pub struct DurableAgentControl {
+    commands_tx: mpsc::UnboundedSender<ManagerCommand>,
+}
+
+impl DurableAgentControl {
+    pub fn abort(&self) -> Result<(), DurableAgentError> {
+        self.commands_tx
+            .send(ManagerCommand::Abort)
+            .map_err(|_| DurableAgentError::CommandChannelClosed)
+    }
+}
+
+struct DurableCheckpointer<D, R>
 where
     D: DurableAgentStore,
     R: Clone,
@@ -156,16 +196,17 @@ where
     store: Arc<D>,
     persisted_history: AsyncMutex<Vec<Message>>,
     repair_message: Option<String>,
+    commands_tx: mpsc::UnboundedSender<ManagerCommand>,
     event_observer: Option<EventObserver<R>>,
-    assistant_observer: Option<AssistantObserver>,
-    turn_observer: Option<TurnObserver>,
+    checkpoint_handler: Option<CheckpointHandler>,
+    abort_reason: Mutex<Option<String>>,
 }
 
 struct CheckpointResult {
     replacement_history: Option<Vec<Message>>,
 }
 
-impl<D, R> DurableCheckpoint<D, R>
+impl<D, R> DurableCheckpointer<D, R>
 where
     D: DurableAgentStore,
     R: Clone + Send + 'static,
@@ -174,17 +215,18 @@ where
         store: Arc<D>,
         persisted_history: Vec<Message>,
         repair_message: Option<String>,
+        commands_tx: mpsc::UnboundedSender<ManagerCommand>,
         event_observer: Option<EventObserver<R>>,
-        assistant_observer: Option<AssistantObserver>,
-        turn_observer: Option<TurnObserver>,
+        checkpoint_handler: Option<CheckpointHandler>,
     ) -> Self {
         Self {
             store,
             persisted_history: AsyncMutex::new(persisted_history),
             repair_message,
+            commands_tx,
             event_observer,
-            assistant_observer,
-            turn_observer,
+            checkpoint_handler,
+            abort_reason: Mutex::new(None),
         }
     }
 
@@ -256,9 +298,39 @@ where
 
     async fn observe_event(&self, event: AgentLoopEvent<R>) -> Result<(), DurableAgentError> {
         if let Some(observer) = &self.event_observer {
-            observer(event).await.map_err(DurableAgentError::Observer)?;
+            observer(event).await.map_err(DurableAgentError::Callback)?;
         }
         Ok(())
+    }
+
+    async fn handle_checkpoint(
+        &self,
+        checkpoint: DurableCheckpoint,
+    ) -> Result<DurableCheckpointAction, DurableAgentError> {
+        let Some(handler) = &self.checkpoint_handler else {
+            return Ok(DurableCheckpointAction::Continue);
+        };
+
+        handler(checkpoint)
+            .await
+            .map_err(DurableAgentError::Callback)
+    }
+
+    fn request_abort(&self, reason: String) -> Result<(), DurableAgentError> {
+        *self
+            .abort_reason
+            .lock()
+            .expect("checkpoint abort reason poisoned") = Some(reason);
+        self.commands_tx
+            .send(ManagerCommand::Abort)
+            .map_err(|_| DurableAgentError::CommandChannelClosed)
+    }
+
+    fn take_abort_reason(&self) -> Option<String> {
+        self.abort_reason
+            .lock()
+            .expect("checkpoint abort reason poisoned")
+            .take()
     }
 
     async fn assistant_finished(
@@ -266,10 +338,12 @@ where
         context: AssistantMessageContext,
     ) -> Result<(), DurableAgentError> {
         self.checkpoint_history(&context.history).await?;
-        if let Some(observer) = &self.assistant_observer {
-            observer(context.clone())
-                .await
-                .map_err(DurableAgentError::Observer)?;
+        match self
+            .handle_checkpoint(DurableCheckpoint::AssistantMessageFinished(context.clone()))
+            .await?
+        {
+            DurableCheckpointAction::Continue => {}
+            DurableCheckpointAction::Abort { reason } => self.request_abort(reason)?,
         }
         self.observe_event(AgentLoopEvent::AssistantMessageFinished {
             message: context.message,
@@ -283,15 +357,22 @@ where
         turn: TurnHookContext,
     ) -> Result<TurnHookAction, DurableAgentError> {
         let checkpoint = self.checkpoint_history(&turn.history).await?;
-        if let Some(observer) = &self.turn_observer {
-            observer(turn.clone())
-                .await
-                .map_err(DurableAgentError::Observer)?;
+        let action = self
+            .handle_checkpoint(DurableCheckpoint::TurnBoundary(turn.clone()))
+            .await?;
+        let abort_reason = match action {
+            DurableCheckpointAction::Continue => self.take_abort_reason(),
+            DurableCheckpointAction::Abort { reason } => Some(reason),
+        };
+
+        match (checkpoint.replacement_history, abort_reason) {
+            (Some(history), Some(reason)) => {
+                Ok(TurnHookAction::ReplaceHistoryAndAbort { history, reason })
+            }
+            (Some(history), None) => Ok(TurnHookAction::ReplaceHistory(history)),
+            (None, Some(reason)) => Ok(TurnHookAction::Abort { reason }),
+            (None, None) => Ok(TurnHookAction::Continue),
         }
-        if let Some(history) = checkpoint.replacement_history {
-            return Ok(TurnHookAction::ReplaceHistory(history));
-        }
-        Ok(TurnHookAction::Continue)
     }
 }
 
@@ -309,8 +390,7 @@ where
     next_inbox_id: AtomicUsize,
     inbox_id_generator: Arc<Mutex<InboxIdGenerator>>,
     event_observer: Arc<Mutex<Option<EventObserver<M::StreamingResponse>>>>,
-    assistant_observer: Arc<Mutex<Option<AssistantObserver>>>,
-    turn_observer: Arc<Mutex<Option<TurnObserver>>>,
+    checkpoint_handler: Arc<Mutex<Option<CheckpointHandler>>>,
 }
 
 impl<M, P, D> DurableAgentHarness<M, P, D>
@@ -330,8 +410,7 @@ where
             next_inbox_id: AtomicUsize::new(0),
             inbox_id_generator: Arc::new(Mutex::new(Arc::new(|index| format!("inbox-{index}")))),
             event_observer: Arc::default(),
-            assistant_observer: Arc::default(),
-            turn_observer: Arc::default(),
+            checkpoint_handler: Arc::default(),
         }
     }
 
@@ -375,7 +454,22 @@ where
         self
     }
 
-    pub fn on_event_observer<F, Fut, E>(self, observer: F) -> Self
+    pub fn control(&self) -> DurableAgentControl {
+        DurableAgentControl {
+            commands_tx: self.commands_tx.clone(),
+        }
+    }
+
+    pub fn abort(&self) -> Result<(), DurableAgentError> {
+        self.control().abort()
+    }
+
+    /// Observe raw loop events after managed durability work has handled them.
+    ///
+    /// This is for logging, metrics, UI streaming, or forwarding lifecycle events.
+    /// Use [`Self::with_checkpoint_handler`] when the callback needs to make a
+    /// durable history decision such as requesting compaction.
+    pub fn with_event_observer<F, Fut, E>(self, observer: F) -> Self
     where
         F: Fn(AgentLoopEvent<M::StreamingResponse>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), E>> + Send + 'static,
@@ -387,44 +481,47 @@ where
                 Box::pin(async move {
                     future
                         .await
-                        .map_err(|err| Box::new(err) as DurableAgentObserverError)
+                        .map_err(|err| Box::new(err) as DurableAgentCallbackError)
                 })
             }));
         self
     }
 
-    pub fn on_assistant_message_finished_observer<F, Fut, E>(self, observer: F) -> Self
+    /// Handle durable checkpoint boundaries after internal persistence and ACKs.
+    ///
+    /// The handler receives assistant-message snapshots and turn boundaries only
+    /// after the harness has persisted the relevant transcript delta. Assistant
+    /// snapshots are for early persistence/recovery and may be temporarily
+    /// provider-invalid when tool calls are waiting for results. Turn boundaries
+    /// are provider-valid and are the right default for compaction.
+    ///
+    /// Each checkpoint context includes `end_reason`; `Some(reason)` means the
+    /// current run is expected to end at this boundary, while `None` means the
+    /// turn is still active or another turn is already queued. That distinction
+    /// lets compaction code avoid rewriting history when no next turn is
+    /// planned.
+    ///
+    /// Return [`DurableCheckpointAction::Continue`] to keep running, or
+    /// [`DurableCheckpointAction::Abort`] to stop the active run at the next safe
+    /// commit boundary. If aborting after a partial assistant snapshot requires
+    /// unanswered-tool-call repair, the harness repairs/replaces in-memory
+    /// history before the run exits. Handler errors fail the managed run and are
+    /// returned by [`Self::wait_for_idle`].
+    pub fn with_checkpoint_handler<F, Fut, E>(self, handler: F) -> Self
     where
-        F: Fn(AssistantMessageContext) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        F: Fn(DurableCheckpoint) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<DurableCheckpointAction, E>> + Send + 'static,
         E: Error + Send + Sync + 'static,
     {
         *self
-            .assistant_observer
+            .checkpoint_handler
             .lock()
-            .expect("assistant observer poisoned") = Some(Arc::new(move |context| {
-            let future = observer(context);
+            .expect("checkpoint handler poisoned") = Some(Arc::new(move |checkpoint| {
+            let future = handler(checkpoint);
             Box::pin(async move {
                 future
                     .await
-                    .map_err(|err| Box::new(err) as DurableAgentObserverError)
-            })
-        }));
-        self
-    }
-
-    pub fn on_turn_committed_observer<F, Fut, E>(self, observer: F) -> Self
-    where
-        F: Fn(TurnHookContext) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<(), E>> + Send + 'static,
-        E: Error + Send + Sync + 'static,
-    {
-        *self.turn_observer.lock().expect("turn observer poisoned") = Some(Arc::new(move |turn| {
-            let future = observer(turn);
-            Box::pin(async move {
-                future
-                    .await
-                    .map_err(|err| Box::new(err) as DurableAgentObserverError)
+                    .map_err(|err| Box::new(err) as DurableAgentCallbackError)
             })
         }));
         self
@@ -472,26 +569,21 @@ where
             .lock()
             .expect("event observer poisoned")
             .clone();
-        let assistant_observer = self
-            .assistant_observer
+        let checkpoint_handler = self
+            .checkpoint_handler
             .lock()
-            .expect("assistant observer poisoned")
-            .clone();
-        let turn_observer = self
-            .turn_observer
-            .lock()
-            .expect("turn observer poisoned")
+            .expect("checkpoint handler poisoned")
             .clone();
         let store = self.store.clone();
         let initial_history = loop_.initial_history.clone();
         let repair_message = loop_.unanswered_tool_call_repair.clone();
-        let checkpoint = Arc::new(DurableCheckpoint::new(
+        let checkpoint = Arc::new(DurableCheckpointer::new(
             store.clone(),
             initial_history,
             repair_message,
+            self.commands_tx.clone(),
             event_observer.clone(),
-            assistant_observer,
-            turn_observer,
+            checkpoint_handler,
         ));
 
         let assistant_checkpoint = checkpoint.clone();
@@ -584,7 +676,10 @@ where
             .await
             .map_err(DurableAgentError::Store)?;
         self.commands_tx
-            .send(ManagerCommand::Signal(QueuedSignal { kind, message }))
+            .send(ManagerCommand::Signal(Box::new(QueuedSignal {
+                kind,
+                message,
+            })))
             .map_err(|_| DurableAgentError::CommandChannelClosed)?;
         Ok(entry)
     }
@@ -613,7 +708,7 @@ where
     commands_rx: mpsc::UnboundedReceiver<ManagerCommand>,
     pending: VecDeque<QueuedSignal>,
     waiters: Vec<oneshot::Sender<Result<EndReason, DurableAgentError>>>,
-    checkpoint: Arc<DurableCheckpoint<D, M::StreamingResponse>>,
+    checkpoint: Arc<DurableCheckpointer<D, M::StreamingResponse>>,
     last_end_reason: EndReason,
     failed_message: Option<String>,
     did_continue_initial_state: bool,
@@ -681,7 +776,11 @@ where
 
     fn handle_idle_command(&mut self, command: ManagerCommand) {
         match command {
-            ManagerCommand::Signal(signal) => self.pending.push_back(signal),
+            ManagerCommand::Signal(signal) => self.pending.push_back(*signal),
+            ManagerCommand::Abort => {
+                self.pending.clear();
+                self.last_end_reason = EndReason::Aborted;
+            }
             ManagerCommand::Wait(waiter) => self.waiters.push(waiter),
         }
     }
@@ -736,7 +835,12 @@ where
                     };
                     match command {
                         ManagerCommand::Signal(signal) => {
-                            send_signal_to_active(&signal_tx, signal)?;
+                            send_signal_to_active(&signal_tx, *signal)?;
+                        }
+                        ManagerCommand::Abort => {
+                            signal_tx
+                                .send(Command::Abort)
+                                .map_err(|_| DurableAgentError::CommandChannelClosed)?;
                         }
                         ManagerCommand::Wait(waiter) => {
                             self.waiters.push(waiter);
