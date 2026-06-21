@@ -616,6 +616,126 @@ async fn steering_messages_are_applied_together_by_default() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn steer_ready_at_idle_boundary_prevents_loop_from_ending() {
+    let first_commit_entered = Arc::new(Notify::new());
+    let release_first_commit = Arc::new(Notify::new());
+    let first_commit_seen = Arc::new(AtomicBool::new(false));
+    let model = MockCompletionModel::from_stream_turns([
+        [
+            MockStreamEvent::text("first"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+        [
+            MockStreamEvent::text("steered"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+    ]);
+    let agent = AgentBuilder::new(model.clone()).build();
+    let hook_first_commit_entered = first_commit_entered.clone();
+    let hook_release_first_commit = release_first_commit.clone();
+    let hook_first_commit_seen = first_commit_seen.clone();
+    let agent_loop = AgentLoop::new(agent).with_turn_hook(move |_, turn| {
+        let hook_first_commit_entered = hook_first_commit_entered.clone();
+        let hook_release_first_commit = hook_release_first_commit.clone();
+        let hook_first_commit_seen = hook_first_commit_seen.clone();
+        async move {
+            if !hook_first_commit_seen.swap(true, Ordering::SeqCst) {
+                assert_eq!(turn.end_reason, Some(EndReason::Idle));
+                hook_first_commit_entered.notify_one();
+                hook_release_first_commit.notified().await;
+            }
+            Ok::<_, std::io::Error>(TurnHookAction::Continue)
+        }
+    });
+
+    let handle = agent_loop.prompt(Message::user("start"));
+    handle.finish_when_idle().unwrap();
+    timeout(Duration::from_secs(1), first_commit_entered.notified())
+        .await
+        .expect("first commit should reach idle boundary");
+
+    handle.steer(Message::user("late steer")).unwrap();
+    release_first_commit.notify_one();
+    let result = timeout(Duration::from_secs(1), handle.wait())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(result.end_reason, EndReason::Idle);
+    assert_eq!(result.last_response.as_deref(), Some("steered"));
+    assert_eq!(model.request_count(), 2);
+    assert_eq!(user_prompts(&model), vec!["start", "late steer"]);
+    assert_eq!(
+        user_texts(result.history.iter()),
+        vec!["start", "late steer"]
+    );
+    assert_eq!(
+        assistant_texts(result.history.iter()),
+        vec!["first", "steered"]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interrupt_ready_at_idle_boundary_prevents_loop_from_ending() {
+    let first_commit_entered = Arc::new(Notify::new());
+    let release_first_commit = Arc::new(Notify::new());
+    let first_commit_seen = Arc::new(AtomicBool::new(false));
+    let model = MockCompletionModel::from_stream_turns([
+        [
+            MockStreamEvent::text("first"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+        [
+            MockStreamEvent::text("interrupted"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+    ]);
+    let agent = AgentBuilder::new(model.clone()).build();
+    let hook_first_commit_entered = first_commit_entered.clone();
+    let hook_release_first_commit = release_first_commit.clone();
+    let hook_first_commit_seen = first_commit_seen.clone();
+    let agent_loop = AgentLoop::new(agent).with_turn_hook(move |_, turn| {
+        let hook_first_commit_entered = hook_first_commit_entered.clone();
+        let hook_release_first_commit = hook_release_first_commit.clone();
+        let hook_first_commit_seen = hook_first_commit_seen.clone();
+        async move {
+            if !hook_first_commit_seen.swap(true, Ordering::SeqCst) {
+                assert_eq!(turn.end_reason, Some(EndReason::Idle));
+                hook_first_commit_entered.notify_one();
+                hook_release_first_commit.notified().await;
+            }
+            Ok::<_, std::io::Error>(TurnHookAction::Continue)
+        }
+    });
+
+    let handle = agent_loop.prompt(Message::user("start"));
+    handle.finish_when_idle().unwrap();
+    timeout(Duration::from_secs(1), first_commit_entered.notified())
+        .await
+        .expect("first commit should reach idle boundary");
+
+    handle.interrupt(Message::user("late interrupt")).unwrap();
+    release_first_commit.notify_one();
+    let result = timeout(Duration::from_secs(1), handle.wait())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(result.end_reason, EndReason::Idle);
+    assert_eq!(result.last_response.as_deref(), Some("interrupted"));
+    assert_eq!(model.request_count(), 2);
+    assert_eq!(user_prompts(&model), vec!["start", "late interrupt"]);
+    assert_eq!(
+        user_texts(result.history.iter()),
+        vec!["start", "late interrupt"]
+    );
+    assert_eq!(
+        assistant_texts(result.history.iter()),
+        vec!["first", "interrupted"]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn follow_ups_are_applied_one_at_a_time() {
     let model = MockCompletionModel::from_stream_turns([
         [
@@ -2373,9 +2493,12 @@ fn partial_turn_ignores_unanswered_tool_call() {
 }
 
 fn user_prompts(model: &MockCompletionModel) -> Vec<String> {
-    model
-        .requests()
-        .into_iter()
+    request_user_prompts(&model.requests())
+}
+
+fn request_user_prompts(requests: &[CompletionRequest]) -> Vec<String> {
+    requests
+        .iter()
         .map(|request| {
             request
                 .chat_history

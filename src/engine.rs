@@ -567,7 +567,7 @@ where
                     match item {
                         Ok(item) => {
                             self.emit(AgentLoopEvent::Rig(item.clone()));
-                            if let Some(end_reason) = self
+                            if let Some(action) = self
                                 .handle_stream_item(
                                     item,
                                     &turn,
@@ -577,7 +577,7 @@ where
                                 )
                                 .await?
                             {
-                                return Ok(PromptAction::Finish(end_reason));
+                                return Ok(action);
                             }
                         }
                         Err(err) => {
@@ -666,7 +666,7 @@ where
         partial_turn: &mut PartialTurn,
         assistant_message_hook: &mut Option<AssistantMessageHookTask>,
         commands_closed: bool,
-    ) -> Result<Option<EndReason>, AgentLoopError> {
+    ) -> Result<Option<PromptAction>, AgentLoopError> {
         match item {
             MultiTurnStreamItem::StreamAssistantItem(item) => {
                 let is_message_boundary = matches!(item, StreamedAssistantContent::ToolCall { .. });
@@ -712,8 +712,10 @@ where
                         )
                         .await?
                 {
-                    return Ok(Some(end_reason));
+                    return Ok(Some(PromptAction::Finish(end_reason)));
                 }
+                self.set_turn_running(false);
+                return Ok(Some(PromptAction::Continue));
             }
             MultiTurnStreamItem::CompletionCall(_) => {}
             _ => {}
