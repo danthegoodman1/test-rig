@@ -10,14 +10,15 @@ pub use api::{
     AssistantMessageHookError, DEFAULT_MAX_TURNS, DEFAULT_UNANSWERED_TOOL_CALL_REPAIR_MESSAGE,
     EndReason, IncrementalToolResultPersistence, InvalidMessageHistoryError, QueueKind,
     ToolResultKey, ToolResultPersistenceError, ToolResultPersistenceFuture, TurnHookAction,
-    TurnHookContext, TurnHookError,
+    TurnHookContext, TurnHookError, TurnOutcomeKind,
 };
 pub use durable::{
     DurableAgentCallbackError, DurableAgentControl, DurableAgentError, DurableAgentFuture,
     DurableAgentHarness, DurableAgentStore, DurableAgentStoreError, DurableCheckpoint,
     DurableCheckpointAction, DurableInboxEntry, DurableInboxKind, DurableInboxStatus,
-    INBOX_ENTRY_ID_PARAM, InMemoryDurableAgentStore, InMemoryDurableAgentStoreSnapshot,
-    PersistMessagesArgs, inbox_id_from_message, inbox_ids_from_messages, tag_message_with_inbox_id,
+    DurableTurnOutcome, INBOX_ENTRY_ID_PARAM, InMemoryDurableAgentStore,
+    InMemoryDurableAgentStoreSnapshot, PersistMessagesArgs, inbox_id_from_message,
+    inbox_ids_from_messages, tag_message_with_inbox_id,
 };
 pub use history::{repair_unanswered_tool_calls, repair_unanswered_tool_calls_with_persistence};
 

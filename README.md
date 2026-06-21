@@ -109,7 +109,8 @@ impl DurableAgentStore for MyStore {
     }
 
     fn persist_messages_and_ack(&self, args: PersistMessagesArgs) -> DurableAgentFuture<()> {
-        // Atomically append transcript messages and ACK matching inbox rows.
+        // Atomically append transcript messages, ACK matching inbox rows, and
+        // record args.turn_outcome when the checkpoint is a turn boundary.
     }
 }
 ```
@@ -145,6 +146,12 @@ The tag lives in the text block's `additional_params` under
 messages, the harness includes those ids in `PersistMessagesArgs` so the store
 can atomically persist the messages and ACK the durable inbox rows in the same
 transaction.
+
+When a checkpoint is also a turn boundary, `PersistMessagesArgs::turn_outcome`
+contains the turn outcome kind, optional terminal loop reason, and provider
+usage. The outcome is part of the same durable transaction. It may be present
+even when `messages` is empty because assistant snapshots can be persisted
+before the final turn boundary records usage.
 
 By default inbox ids are harness-local monotonic strings like `inbox-1`. Use
 `with_inbox_id_generator(...)` to provide ids from your own database or id

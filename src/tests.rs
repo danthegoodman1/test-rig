@@ -1821,7 +1821,7 @@ async fn durable_harness_wait_for_idle_reports_no_run_when_nothing_ran() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn in_memory_durable_store_tracks_pending_acks_and_tool_results() {
+async fn in_memory_durable_store_tracks_pending_acks_tool_results_and_turn_outcomes() {
     let store = InMemoryDurableAgentStore::default();
     let message = tag_message_with_inbox_id(Message::user("start"), "inbox-1").unwrap();
     let entry = DurableInboxEntry {
@@ -1843,6 +1843,11 @@ async fn in_memory_durable_store_tracks_pending_acks_and_tool_results() {
         .persist_messages_and_ack(PersistMessagesArgs {
             messages: vec![message, tool_result_message],
             ack_inbox_entry_ids: vec!["inbox-1".to_string()],
+            turn_outcome: Some(DurableTurnOutcome {
+                kind: TurnOutcomeKind::Completed,
+                end_reason: Some(EndReason::Idle),
+                usage: Some(Usage::new()),
+            }),
         })
         .await
         .unwrap();
@@ -1855,6 +1860,14 @@ async fn in_memory_durable_store_tracks_pending_acks_and_tool_results() {
         DurableInboxStatus::Acked
     );
     assert_eq!(snapshot.persisted_messages.len(), 2);
+    assert_eq!(
+        snapshot.turn_outcomes,
+        vec![DurableTurnOutcome {
+            kind: TurnOutcomeKind::Completed,
+            end_reason: Some(EndReason::Idle),
+            usage: Some(Usage::new()),
+        }]
+    );
     assert_eq!(
         snapshot
             .tool_results
@@ -2055,6 +2068,21 @@ async fn durable_harness_interrupt_repair_prefers_persisted_tool_result() {
         vec!["persisted tool result"]
     );
     assert!(state.acked_inbox_ids.contains(&interrupt.id));
+    assert_eq!(
+        state.turn_outcomes,
+        vec![
+            DurableTurnOutcome {
+                kind: TurnOutcomeKind::Interrupted,
+                end_reason: None,
+                usage: None,
+            },
+            DurableTurnOutcome {
+                kind: TurnOutcomeKind::Completed,
+                end_reason: Some(EndReason::Idle),
+                usage: Some(Usage::new()),
+            },
+        ]
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2308,6 +2336,19 @@ async fn durable_harness_runs_checkpoint_handler_after_persistence() {
         &[Some(EndReason::Idle), Some(EndReason::Idle)]
     );
     assert_eq!(&seen_usage.lock().unwrap()[..], &[Some(usage), Some(usage)]);
+
+    let expected_outcome = DurableTurnOutcome {
+        kind: TurnOutcomeKind::Completed,
+        end_reason: Some(EndReason::Idle),
+        usage: Some(usage),
+    };
+    let state = store.snapshot();
+    assert_eq!(state.turn_outcomes, vec![expected_outcome.clone()]);
+    assert!(state.transactions.iter().any(|transaction| {
+        transaction.messages.is_empty()
+            && transaction.ack_inbox_entry_ids.is_empty()
+            && transaction.turn_outcome.as_ref() == Some(&expected_outcome)
+    }));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2639,6 +2680,7 @@ struct MemoryDurableAgentStoreState {
     persisted: Vec<Message>,
     acked_inbox_ids: Vec<String>,
     transactions: Vec<PersistMessagesArgs>,
+    turn_outcomes: Vec<DurableTurnOutcome>,
     tool_results: BTreeMap<ToolResultKey, ToolResult>,
 }
 
@@ -2721,6 +2763,9 @@ impl DurableAgentStore for MemoryDurableAgentStore {
             }
             let mut state = store.inner.lock().unwrap();
             state.transactions.push(args.clone());
+            if let Some(turn_outcome) = &args.turn_outcome {
+                state.turn_outcomes.push(turn_outcome.clone());
+            }
             state.persisted.extend(args.messages);
             state.acked_inbox_ids.extend(args.ack_inbox_entry_ids);
             Ok(())

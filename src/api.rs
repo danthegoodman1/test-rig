@@ -586,6 +586,8 @@ pub struct TurnHookContext {
     pub history: Vec<Message>,
     /// The ordered messages generated at this turn boundary. This can be empty.
     pub new_messages: Vec<Message>,
+    /// What happened to the turn at this commit boundary.
+    pub outcome_kind: TurnOutcomeKind,
     /// The expected terminal reason for this loop, if this boundary is expected
     /// to end the current run. `None` means more work is already queued or the
     /// loop cannot yet prove it is ending.
@@ -594,6 +596,15 @@ pub struct TurnHookContext {
     ///
     /// Providers may omit usage; in that case this is `None`.
     pub usage: Option<Usage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TurnOutcomeKind {
+    Completed,
+    Interrupted,
+    Aborted,
+    TimedOut,
 }
 
 #[derive(Clone, Debug)]

@@ -28,7 +28,7 @@ use crate::{
         ApiErrorKind, AssistantMessageContext, AssistantMessageHook, AssistantMessageHookFuture,
         Command, EndReason, IncrementalToolResultPersistence, InvalidMessageHistoryError,
         SharedMessages, SharedTurnRunning, ToolResultKey, TurnHook, TurnHookAction,
-        TurnHookContext, lock_messages,
+        TurnHookContext, TurnOutcomeKind, lock_messages,
     },
     history::{
         PartialTurn, repair_unanswered_tool_calls_with_persistence, validate_message_history,
@@ -820,6 +820,7 @@ where
             let turn = TurnHookContext {
                 history: next_history.clone(),
                 new_messages: messages.clone(),
+                outcome_kind: event.outcome_kind(),
                 end_reason: event.end_reason(),
                 usage: event.usage(),
             };
@@ -943,6 +944,15 @@ impl CommitEvent {
         match self {
             Self::Committed { usage, .. } => *usage,
             Self::Interrupted | Self::Aborted | Self::TimedOut { .. } => None,
+        }
+    }
+
+    fn outcome_kind(&self) -> TurnOutcomeKind {
+        match self {
+            Self::Committed { .. } => TurnOutcomeKind::Completed,
+            Self::Interrupted => TurnOutcomeKind::Interrupted,
+            Self::Aborted => TurnOutcomeKind::Aborted,
+            Self::TimedOut { .. } => TurnOutcomeKind::TimedOut,
         }
     }
 

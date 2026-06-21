@@ -14,7 +14,7 @@ use std::{
 use rig::{
     OneOrMany,
     agent::{Agent, PromptHook},
-    completion::{CompletionModel, GetTokenUsage},
+    completion::{CompletionModel, GetTokenUsage, Usage},
     message::{AssistantContent, Message, Text, ToolResult, UserContent},
     wasm_compat::WasmCompatSend,
 };
@@ -28,8 +28,8 @@ use tokio::{
 use super::{
     AgentLoop, AgentLoopError, AgentLoopEvent, AgentLoopHandle, AssistantMessageContext, Command,
     EndReason, IncrementalToolResultPersistence, ToolResultKey, ToolResultPersistenceFuture,
-    TurnHookAction, TurnHookContext, repair_unanswered_tool_calls_with_persistence,
-    validate_message_history,
+    TurnHookAction, TurnHookContext, TurnOutcomeKind,
+    repair_unanswered_tool_calls_with_persistence, validate_message_history,
 };
 
 pub const INBOX_ENTRY_ID_PARAM: &str = "rigloop_inbox_entry_id";
@@ -71,8 +71,25 @@ pub struct DurableInboxEntry {
 
 #[derive(Clone, Debug)]
 pub struct PersistMessagesArgs {
+    /// Transcript messages that became durable in this checkpoint.
     pub messages: Vec<Message>,
+    /// Inbox entries whose tagged user messages are included in `messages`.
     pub ack_inbox_entry_ids: Vec<String>,
+    /// Turn metadata to persist atomically when this checkpoint is a turn boundary.
+    pub turn_outcome: Option<DurableTurnOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableTurnOutcome {
+    /// What happened to this turn at the commit boundary.
+    pub kind: TurnOutcomeKind,
+    /// Terminal loop reason when this turn boundary also ends the current run.
+    ///
+    /// `None` means the turn ended, but more work is queued or the loop cannot
+    /// yet prove it is ending.
+    pub end_reason: Option<EndReason>,
+    /// Aggregated provider usage for the completed turn when available.
+    pub usage: Option<Usage>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +138,7 @@ struct InMemoryDurableAgentStoreState {
     acked_inbox_ids: Vec<String>,
     persisted_messages: Vec<Message>,
     transactions: Vec<PersistMessagesArgs>,
+    turn_outcomes: Vec<DurableTurnOutcome>,
     tool_results: BTreeMap<ToolResultKey, ToolResult>,
 }
 
@@ -132,6 +150,7 @@ pub struct InMemoryDurableAgentStoreSnapshot {
     pub acked_inbox_ids: Vec<String>,
     pub persisted_messages: Vec<Message>,
     pub transactions: Vec<PersistMessagesArgs>,
+    pub turn_outcomes: Vec<DurableTurnOutcome>,
     pub tool_results: BTreeMap<ToolResultKey, ToolResult>,
 }
 
@@ -192,6 +211,7 @@ impl InMemoryDurableAgentStoreState {
             acked_inbox_ids: self.acked_inbox_ids.clone(),
             persisted_messages: self.persisted_messages.clone(),
             transactions: self.transactions.clone(),
+            turn_outcomes: self.turn_outcomes.clone(),
             tool_results: self.tool_results.clone(),
         }
     }
@@ -254,6 +274,9 @@ impl DurableAgentStore for InMemoryDurableAgentStore {
                 .lock()
                 .expect("in-memory durable store poisoned");
             state.transactions.push(args.clone());
+            if let Some(turn_outcome) = &args.turn_outcome {
+                state.turn_outcomes.push(turn_outcome.clone());
+            }
             state
                 .acked_inbox_ids
                 .extend(args.ack_inbox_entry_ids.clone());
@@ -428,12 +451,13 @@ where
     async fn checkpoint_history(
         &self,
         history: &[Message],
+        turn_outcome: Option<DurableTurnOutcome>,
     ) -> Result<CheckpointResult, DurableAgentError> {
         let mut persisted_history = self.persisted_history.lock().await;
 
         if history.starts_with(&persisted_history) {
             let new_messages = history[persisted_history.len()..].to_vec();
-            self.persist_delta(new_messages).await?;
+            self.persist_delta(new_messages, turn_outcome).await?;
             *persisted_history = history.to_vec();
             return Ok(CheckpointResult {
                 replacement_history: None,
@@ -450,7 +474,7 @@ where
 
         let mut new_messages = repaired_history[persisted_history.len()..].to_vec();
         new_messages.extend_from_slice(&history[common_prefix_len..]);
-        self.persist_delta(new_messages).await?;
+        self.persist_delta(new_messages, turn_outcome).await?;
         *persisted_history = replacement_history.clone();
 
         Ok(CheckpointResult {
@@ -458,8 +482,12 @@ where
         })
     }
 
-    async fn persist_delta(&self, messages: Vec<Message>) -> Result<(), DurableAgentError> {
-        if messages.is_empty() {
+    async fn persist_delta(
+        &self,
+        messages: Vec<Message>,
+        turn_outcome: Option<DurableTurnOutcome>,
+    ) -> Result<(), DurableAgentError> {
+        if messages.is_empty() && turn_outcome.is_none() {
             return Ok(());
         }
 
@@ -468,6 +496,7 @@ where
             .persist_messages_and_ack(PersistMessagesArgs {
                 messages,
                 ack_inbox_entry_ids,
+                turn_outcome,
             })
             .await
             .map_err(DurableAgentError::Store)?;
@@ -532,7 +561,7 @@ where
         &self,
         context: AssistantMessageContext,
     ) -> Result<(), DurableAgentError> {
-        self.checkpoint_history(&context.history).await?;
+        self.checkpoint_history(&context.history, None).await?;
         match self
             .handle_checkpoint(DurableCheckpoint::AssistantMessageFinished(context.clone()))
             .await?
@@ -551,7 +580,14 @@ where
         &self,
         turn: TurnHookContext,
     ) -> Result<TurnHookAction, DurableAgentError> {
-        let checkpoint = self.checkpoint_history(&turn.history).await?;
+        let turn_outcome = DurableTurnOutcome {
+            kind: turn.outcome_kind.clone(),
+            end_reason: turn.end_reason.clone(),
+            usage: turn.usage,
+        };
+        let checkpoint = self
+            .checkpoint_history(&turn.history, Some(turn_outcome))
+            .await?;
         let action = self
             .handle_checkpoint(DurableCheckpoint::TurnBoundary(turn.clone()))
             .await?;
