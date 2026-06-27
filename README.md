@@ -1,5 +1,8 @@
 # rigloop
 
+[![crates.io](https://img.shields.io/crates/v/rigloop.svg)](https://crates.io/crates/rigloop)
+[![docs.rs](https://docs.rs/rigloop/badge.svg)](https://docs.rs/rigloop)
+
 A small agent loop harness for [Rig](https://github.com/0xPlaygrounds/rig).
 
 `rigloop` has two layers:
