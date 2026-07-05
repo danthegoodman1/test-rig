@@ -929,6 +929,95 @@ async fn abort_returns_aborted_end_reason() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn pause_while_idle_returns_paused_end_reason() {
+    let model = MockCompletionModel::from_stream_turns([[
+        MockStreamEvent::text("first"),
+        MockStreamEvent::final_response_with_default_usage(),
+    ]]);
+    let agent = AgentBuilder::new(model.clone()).build();
+    let agent_loop = AgentLoop::new(agent);
+    let handle = agent_loop.prompt(Message::user("start"));
+    let mut events = handle.subscribe();
+
+    loop {
+        match events.recv().await.unwrap() {
+            AgentLoopEvent::TurnCommitted { .. } => break,
+            AgentLoopEvent::LoopEnded { end_reason } => {
+                panic!("loop ended before pause could be queued: {end_reason:?}")
+            }
+            _ => {}
+        }
+    }
+
+    handle.pause().unwrap();
+    let result = timeout(Duration::from_secs(1), handle.wait())
+        .await
+        .expect("pause while idle should finish promptly")
+        .unwrap();
+
+    assert_eq!(result.end_reason, EndReason::Paused);
+    assert_eq!(model.request_count(), 1);
+    assert_eq!(user_texts(result.history.iter()), vec!["start"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pause_mid_turn_leaves_follow_up_unprocessed() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let model = MockCompletionModel::from_stream_turns([
+        [
+            MockStreamEvent::tool_call("call_1", BlockingTool::NAME, serde_json::json!({})),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+        [
+            MockStreamEvent::text("done"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+        [
+            MockStreamEvent::text("queued follow-up"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+    ]);
+    let agent = AgentBuilder::new(model.clone())
+        .tool(BlockingTool {
+            entered: entered.clone(),
+            release: release.clone(),
+        })
+        .build();
+    let seen_end_reasons = Arc::new(Mutex::new(Vec::new()));
+    let hook_seen_end_reasons = seen_end_reasons.clone();
+    let agent_loop = AgentLoop::new(agent).with_turn_hook(move |_, turn| {
+        let hook_seen_end_reasons = hook_seen_end_reasons.clone();
+        async move {
+            hook_seen_end_reasons.lock().unwrap().push(turn.end_reason);
+            Ok::<_, std::io::Error>(TurnHookAction::Continue)
+        }
+    });
+    let handle = agent_loop.prompt(Message::user("start"));
+
+    timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("tool should block the active turn");
+    handle.follow_up(Message::user("follow-up")).unwrap();
+    handle.pause().unwrap();
+    release.notify_one();
+
+    let result = timeout(Duration::from_secs(1), handle.wait())
+        .await
+        .expect("pause should finish after the active turn")
+        .unwrap();
+
+    assert_eq!(result.end_reason, EndReason::Paused);
+    assert_eq!(result.last_response.as_deref(), Some("done"));
+    assert_eq!(model.request_count(), 2);
+    assert_eq!(user_texts(result.history.iter()), vec!["start"]);
+    assert_eq!(
+        &seen_end_reasons.lock().unwrap()[..],
+        &[Some(EndReason::Paused)]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn dropping_handle_aborts_running_loop() {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -1818,6 +1907,106 @@ async fn durable_harness_wait_for_idle_reports_no_run_when_nothing_ran() {
 
     assert_eq!(end_reason, EndReason::NoRun);
     assert_eq!(model.request_count(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_harness_pause_while_idle_resolves_waiters_as_paused() {
+    let model = MockCompletionModel::from_stream_turns([[
+        MockStreamEvent::text("unused"),
+        MockStreamEvent::final_response_with_default_usage(),
+    ]]);
+    let store = MemoryDurableAgentStore::default();
+    let agent = AgentBuilder::new(model.clone()).build();
+    let harness = DurableAgentHarness::new(agent, store);
+
+    harness.start().unwrap();
+    harness.pause().unwrap();
+    let end_reason = timeout(Duration::from_secs(1), harness.wait_for_idle())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(end_reason, EndReason::Paused);
+    assert_eq!(model.request_count(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_harness_pause_mid_turn_leaves_queued_follow_up_submitted() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let model = MockCompletionModel::from_stream_turns([
+        [
+            MockStreamEvent::tool_call("call_1", BlockingTool::NAME, serde_json::json!({})),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+        [
+            MockStreamEvent::text("done"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+        [
+            MockStreamEvent::text("queued follow-up"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+        [
+            MockStreamEvent::text("later follow-up"),
+            MockStreamEvent::final_response_with_default_usage(),
+        ],
+    ]);
+    let store = MemoryDurableAgentStore::default();
+    let agent = AgentBuilder::new(model.clone())
+        .tool(BlockingTool {
+            entered: entered.clone(),
+            release: release.clone(),
+        })
+        .build();
+    let harness = DurableAgentHarness::new(agent, store.clone());
+
+    let start = harness.follow_up("start").await.unwrap();
+    harness.start().unwrap();
+    timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("tool should block the active durable turn");
+
+    let queued = harness.follow_up("queued").await.unwrap();
+    harness.pause().unwrap();
+    release.notify_one();
+    let end_reason = timeout(Duration::from_secs(1), harness.wait_for_idle())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(end_reason, EndReason::Paused);
+    assert_eq!(model.request_count(), 2);
+
+    let later = harness.follow_up("later").await.unwrap();
+    let later_end_reason = timeout(Duration::from_secs(1), harness.wait_for_idle())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(later_end_reason, EndReason::Paused);
+    assert_eq!(model.request_count(), 2);
+
+    let state = store.snapshot();
+    assert_eq!(
+        state
+            .inbox
+            .iter()
+            .map(|entry| &entry.id)
+            .collect::<Vec<_>>(),
+        vec![&start.id, &queued.id, &later.id]
+    );
+    assert!(state.acked_inbox_ids.contains(&start.id));
+    assert!(!state.acked_inbox_ids.contains(&queued.id));
+    assert!(!state.acked_inbox_ids.contains(&later.id));
+    assert_eq!(user_texts(state.persisted.iter()), vec!["start"]);
+    assert_eq!(
+        state.turn_outcomes,
+        vec![DurableTurnOutcome {
+            kind: TurnOutcomeKind::Completed,
+            end_reason: Some(EndReason::Paused),
+            usage: Some(Usage::new()),
+        }]
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

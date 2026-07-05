@@ -162,6 +162,7 @@ where
     resumes: usize,
     follow_ups: VecDeque<Message>,
     finish_when_idle: bool,
+    pause_latched: bool,
     last_response: Option<String>,
 }
 
@@ -217,6 +218,7 @@ where
             resumes,
             follow_ups: VecDeque::new(),
             finish_when_idle: false,
+            pause_latched: false,
             last_response: None,
         }
     }
@@ -252,6 +254,7 @@ where
             Command::Resume => self.resumes += 1,
             Command::Interrupt(message) => self.immediate.push_front(message),
             Command::Abort => return CommandAction::Abort,
+            Command::Pause => self.pause_latched = true,
             Command::FinishWhenIdle => self.finish_when_idle = true,
         }
 
@@ -427,6 +430,10 @@ where
                 return Ok(self.finish(EndReason::Aborted));
             }
 
+            if self.pause_latched {
+                return Ok(self.finish(EndReason::Paused));
+            }
+
             if self.finish_when_idle && !self.has_pending_turn() {
                 return Ok(self.finish(EndReason::Idle));
             }
@@ -452,6 +459,10 @@ where
 
             if self.drain_ready_commands(commands_rx) == CommandAction::Abort {
                 return Ok(self.finish(EndReason::Aborted));
+            }
+
+            if self.pause_latched {
+                return Ok(self.finish(EndReason::Paused));
             }
 
             let Some(turn) = self.next_turn() else {
@@ -502,6 +513,8 @@ where
             }
 
             tokio::select! {
+                biased;
+
                 command = commands_rx.recv(), if !commands_closed => {
                     let Some(command) = command else {
                         commands_closed = true;
@@ -532,6 +545,8 @@ where
             }
 
             tokio::select! {
+                biased;
+
                 command = commands_rx.recv(), if !commands_closed => {
                     let Some(command) = command else {
                         commands_closed = true;
@@ -611,11 +626,17 @@ where
         turn: &PreparedTurn,
         partial_turn: &PartialTurn,
     ) -> Result<Option<PromptAction>, AgentLoopError> {
+        if self.pause_latched && !matches!(command, Command::Abort) {
+            self.handle_idle_command(command);
+            return Ok(None);
+        }
+
         match command {
             Command::Steer(message) => self.steering.push_back(message),
             Command::FollowUp(message) => self.follow_ups.push_back(message),
             Command::Resume => self.resumes += 1,
             Command::FinishWhenIdle => self.finish_when_idle = true,
+            Command::Pause => self.pause_latched = true,
             Command::Interrupt(message) => {
                 let messages = turn.partial_messages(partial_turn);
                 if let CommitOutcome::Abort(end_reason) = self
@@ -725,6 +746,10 @@ where
     }
 
     fn projected_final_response_end_reason(&self, commands_closed: bool) -> Option<EndReason> {
+        if self.pause_latched {
+            return Some(EndReason::Paused);
+        }
+
         if self.has_pending_turn() || !(self.finish_when_idle || commands_closed) {
             return None;
         }

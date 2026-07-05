@@ -88,9 +88,15 @@ use rig::message::Message;
 harness.steer("Keep the next answer shorter.").await?;
 harness.follow_up(Message::user("Also give me a checklist.")).await?;
 harness.interrupt("Stop that and answer this instead.").await?;
+harness.pause()?;
 
 let end_reason = harness.wait_for_idle().await?;
 ```
+
+`pause()` is process-local control. It stops at the next safe turn boundary
+without appending conversation content. Durable inbox entries that have been
+submitted but not started remain unacked/submitted so a later process start can
+load and resume them; the current harness stays paused until it is dropped.
 
 The store supplies both durable inbox persistence and completed tool-result
 persistence:
@@ -183,6 +189,7 @@ handle.steer(Message::user("Keep the next answer shorter."))?;
 handle.interrupt(Message::user("Stop that and answer this instead."))?;
 handle.resume()?;
 handle.abort()?;
+handle.pause()?;
 
 let messages = handle.state();
 let result = handle.wait().await?;
@@ -197,6 +204,7 @@ The queue rules are intentionally simple:
 | `interrupt` | Stops the current turn, keeps only valid completed tool results, then runs the new message next. |
 | `resume` | Runs another agent turn using the current history as-is. It is a no-op while a turn is running. |
 | `abort` | Stops the loop. Completed tool results from the current turn are kept. |
+| `pause` | Stops at the next turn boundary without adding conversation content. Queued work is not drained. |
 | `state` | Returns a clone of the committed in-memory Rig message history. |
 | `wait` | Waits for the loop to finish and returns `AgentLoopResult`. |
 
@@ -349,6 +357,7 @@ Known end reasons include:
 | `Idle` | The prompt and all queued work completed. |
 | `NoRun` | A managed wait reached idle without starting or resuming an agent turn. |
 | `Aborted` | The caller aborted the loop. |
+| `Paused` | The caller paused the loop at a safe turn boundary. |
 | `AbortedByHook` | A turn hook or durable checkpoint handler stopped the loop after a commit boundary. |
 | `ContentFilter` | The provider refused or filtered the request/response. |
 | `ContextFull` | The provider rejected the request because the context was too large. |

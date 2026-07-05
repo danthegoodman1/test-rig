@@ -480,6 +480,16 @@ where
         Ok(())
     }
 
+    /// Stop at the next turn boundary without adding conversation content.
+    pub fn pause(&self) -> Result<(), AgentLoopError> {
+        self.send(Command::Pause)?;
+        self.emit(AgentLoopEvent::Queued {
+            kind: QueueKind::Pause,
+            message: None,
+        });
+        Ok(())
+    }
+
     pub(crate) fn finish_when_idle(&self) -> Result<(), AgentLoopError> {
         self.send(Command::FinishWhenIdle)
     }
@@ -541,6 +551,8 @@ pub enum EndReason {
     NoRun,
     /// The caller aborted the loop.
     Aborted,
+    /// The caller paused the loop at a safe turn boundary.
+    Paused,
     /// A turn hook stopped the loop after a commit boundary.
     AbortedByHook { reason: String },
     /// The provider refused or filtered the request or response.
@@ -662,6 +674,7 @@ pub enum QueueKind {
     Resume,
     Interrupt,
     Abort,
+    Pause,
 }
 
 #[derive(Clone, Debug)]
@@ -790,5 +803,6 @@ pub(crate) enum Command {
     Resume,
     Interrupt(Message),
     Abort,
+    Pause,
     FinishWhenIdle,
 }

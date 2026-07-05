@@ -20,7 +20,11 @@ use rig::{
 };
 use serde_json::{Map, Value};
 use tokio::{
-    sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot},
+    sync::{
+        Mutex as AsyncMutex, broadcast,
+        mpsc::{self, error::TryRecvError},
+        oneshot,
+    },
     task::JoinHandle,
     time::Instant,
 };
@@ -390,6 +394,7 @@ struct QueuedSignal {
 enum ManagerCommand {
     Signal(Box<QueuedSignal>),
     Abort,
+    Pause,
     Wait(oneshot::Sender<Result<EndReason, DurableAgentError>>),
 }
 
@@ -402,6 +407,12 @@ impl DurableAgentControl {
     pub fn abort(&self) -> Result<(), DurableAgentError> {
         self.commands_tx
             .send(ManagerCommand::Abort)
+            .map_err(|_| DurableAgentError::CommandChannelClosed)
+    }
+
+    pub fn pause(&self) -> Result<(), DurableAgentError> {
+        self.commands_tx
+            .send(ManagerCommand::Pause)
             .map_err(|_| DurableAgentError::CommandChannelClosed)
     }
 }
@@ -695,6 +706,10 @@ where
         self.control().abort()
     }
 
+    pub fn pause(&self) -> Result<(), DurableAgentError> {
+        self.control().pause()
+    }
+
     /// Observe raw loop events after managed durability work has handled them.
     ///
     /// This is for logging, metrics, UI streaming, or forwarding lifecycle events.
@@ -838,6 +853,7 @@ where
             checkpoint,
             last_end_reason: EndReason::NoRun,
             failed_message: None,
+            paused: false,
             did_continue_initial_state: false,
         };
         *manager = Some(tokio::spawn(async move {
@@ -942,6 +958,7 @@ where
     checkpoint: Arc<DurableCheckpointer<D, M::StreamingResponse>>,
     last_end_reason: EndReason,
     failed_message: Option<String>,
+    paused: bool,
     did_continue_initial_state: bool,
 }
 
@@ -967,10 +984,28 @@ where
                 continue;
             }
 
+            if self.paused {
+                if !self.waiters.is_empty() {
+                    self.finish_waiters(Ok(EndReason::Paused));
+                    continue;
+                }
+
+                let Some(command) = self.commands_rx.recv().await else {
+                    return;
+                };
+                self.handle_paused_command(command);
+                continue;
+            }
+
+            self.drain_ready_commands();
+            if self.paused {
+                continue;
+            }
+
             if let Some(signal) = self.pending.pop_front() {
                 match self.run_prompt(signal).await {
                     Ok(end_reason) => {
-                        self.last_end_reason = end_reason;
+                        self.handle_run_end(end_reason);
                         continue;
                     }
                     Err(err) => {
@@ -984,7 +1019,7 @@ where
                 self.did_continue_initial_state = true;
                 match self.run_resume().await {
                     Ok(end_reason) => {
-                        self.last_end_reason = end_reason;
+                        self.handle_run_end(end_reason);
                         continue;
                     }
                     Err(err) => {
@@ -1012,7 +1047,38 @@ where
                 self.pending.clear();
                 self.last_end_reason = EndReason::Aborted;
             }
+            ManagerCommand::Pause => self.latch_paused(),
             ManagerCommand::Wait(waiter) => self.waiters.push(waiter),
+        }
+    }
+
+    fn handle_paused_command(&mut self, command: ManagerCommand) {
+        match command {
+            ManagerCommand::Signal(signal) => self.pending.push_back(*signal),
+            ManagerCommand::Abort | ManagerCommand::Pause => {}
+            ManagerCommand::Wait(waiter) => self.waiters.push(waiter),
+        }
+    }
+
+    fn drain_ready_commands(&mut self) {
+        loop {
+            match self.commands_rx.try_recv() {
+                Ok(command) => self.handle_idle_command(command),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+            }
+        }
+    }
+
+    fn latch_paused(&mut self) {
+        self.paused = true;
+        self.last_end_reason = EndReason::Paused;
+    }
+
+    fn handle_run_end(&mut self, end_reason: EndReason) {
+        if end_reason == EndReason::Paused {
+            self.latch_paused();
+        } else {
+            self.last_end_reason = end_reason;
         }
     }
 
@@ -1060,17 +1126,29 @@ where
 
         loop {
             tokio::select! {
+                biased;
+
                 command = self.commands_rx.recv() => {
                     let Some(command) = command else {
                         return Err(DurableAgentError::CommandChannelClosed);
                     };
                     match command {
                         ManagerCommand::Signal(signal) => {
-                            send_signal_to_active(&signal_tx, *signal)?;
+                            if self.paused {
+                                self.pending.push_back(*signal);
+                            } else {
+                                send_signal_to_active(&signal_tx, *signal)?;
+                            }
                         }
                         ManagerCommand::Abort => {
                             signal_tx
                                 .send(Command::Abort)
+                                .map_err(|_| DurableAgentError::CommandChannelClosed)?;
+                        }
+                        ManagerCommand::Pause => {
+                            self.latch_paused();
+                            signal_tx
+                                .send(Command::Pause)
                                 .map_err(|_| DurableAgentError::CommandChannelClosed)?;
                         }
                         ManagerCommand::Wait(waiter) => {
