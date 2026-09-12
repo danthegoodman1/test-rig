@@ -1,45 +1,41 @@
-//! Demonstrates the managed durable harness: submit durable signals, start the
-//! agent manager, then wait until queued work is idle.
-
+//! Durable intake and caller-owned restart, using only scripted model responses.
 use rig::{
     agent::AgentBuilder,
-    test_utils::{MockCompletionModel, MockStreamEvent},
+    test_utils::{MockCompletionModel, MockStreamEvent as E},
 };
-use rigloop::{DurableAgentHarness, InMemoryDurableAgentStore};
+use rigloop::{EndReason, MemoryStore, Session};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let agent = AgentBuilder::new(scripted_model()).build();
-    let store = InMemoryDurableAgentStore::default();
-    let harness = DurableAgentHarness::new(agent, store.clone());
+    let store = MemoryStore::default();
+    let agent = AgentBuilder::new(model()).build();
+    let session = Session::new(agent, store.clone()).start()?;
+    let id = session.follow_up("start").await?;
+    assert_eq!(session.wait_for_idle().await?, EndReason::Idle);
+    assert!(store.snapshot().acked_ids.contains(&id));
+    session.pause().await?;
+    session.stopped().await?;
 
-    let start = harness.follow_up("start").await?;
-    for index in 0..10 {
-        harness.steer(format!("steer-{index}")).await?;
-    }
-    for index in 0..3 {
-        harness.follow_up(format!("follow-up-{index}")).await?;
-    }
-
-    harness.start()?;
-    let end_reason = harness.wait_for_idle().await?;
-    let state = store.snapshot();
-
-    assert!(state.acked_inbox_ids.contains(&start.id));
-    assert!(state.pending_inbox_entries.is_empty());
-
-    println!("end_reason: {:?}", end_reason);
-    println!("persisted messages: {}", state.persisted_messages.len());
-    println!("acked inbox rows: {:?}", state.acked_inbox_ids);
-
+    // A real application loads this snapshot from its own database. Explicit
+    // restart preserves pending entry IDs and does not resubmit or retag them.
+    let snapshot = store.snapshot();
+    let resumed = Session::new(AgentBuilder::new(model()).build(), store.clone())
+        .pending(snapshot.pending())
+        .history(snapshot.history)
+        .start()?;
+    resumed.follow_up("continue after restart").await?;
+    assert_eq!(resumed.wait_for_idle().await?, EndReason::Idle);
+    assert!(store.snapshot().pending().is_empty());
+    println!(
+        "{} messages, {} ACKs",
+        store.snapshot().history.len(),
+        store.snapshot().acked_ids.len()
+    );
     Ok(())
 }
-
-fn scripted_model() -> MockCompletionModel {
-    MockCompletionModel::from_stream_turns((0..32).map(|index| {
-        vec![
-            MockStreamEvent::text(format!("synthetic response {index}")),
-            MockStreamEvent::final_response_with_default_usage(),
-        ]
-    }))
+fn model() -> MockCompletionModel {
+    MockCompletionModel::from_stream_turns([vec![
+        E::text("done"),
+        E::final_response_with_default_usage(),
+    ]])
 }
