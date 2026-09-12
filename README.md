@@ -1,376 +1,193 @@
 # rigloop
 
-[![crates.io](https://img.shields.io/crates/v/rigloop.svg)](https://crates.io/crates/rigloop)
-[![docs.rs](https://docs.rs/rigloop/badge.svg)](https://docs.rs/rigloop)
+A small durable session around [Rig](https://github.com/0xPlaygrounds/rig).
 
-A small agent loop harness for [Rig](https://github.com/0xPlaygrounds/rig).
+Rig owns model calls, streaming, canonical assistant messages and tool execution.
+Rigloop owns one session queue, durable inbox ACKs, append-only checkpoints and
+recovery of accepted tool results. Context policies and compaction use Rig's
+memory crate. The runtime and memory integrations use Rig 0.42.
 
-`rigloop` has two layers:
-
-- `DurableAgentHarness`: the recommended application API. Start a managed agent
-  once, signal it over time, wait for idle, and atomically persist transcript
-  deltas with durable inbox ACKs.
-- `AgentLoop`: the lower-level execution engine. Prompt, resume, steer,
-  follow up, interrupt, abort, subscribe to events, and inspect in-memory Rig
-  history directly.
-
-Rig still owns model calls and tools. Rigloop owns loop control, provider-safe
-history ordering, interruption, partial commits, durable signal ACKs, and the
-small amount of recovery needed around unanswered tool calls.
-
-## Contents
-
-- [Install](#install)
-- [Recommended API](#recommended-api)
-- [Durable Signals](#durable-signals)
-- [Low-Level Engine](#low-level-engine)
-- [Timeouts](#timeouts)
-- [Events and Checkpoints](#events-and-checkpoints)
-- [History and Repair](#history-and-repair)
-- [End Reasons](#end-reasons)
-- [Inspiration](#inspiration)
-
-## Install
-
-```toml
-[dependencies]
-rigloop = "0.1"
-rig = "0.38"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-```
-
-## Recommended API
-
-Use `DurableAgentHarness` when building an app or service that needs a
-long-lived agent session:
+## A session
 
 ```rust
-use rig::{
-    client::CompletionClient,
-    providers::openai,
-};
-use rigloop::{DurableAgentHarness, InMemoryDurableAgentStore};
+use rig::agent::Agent;
+use rigloop::{EndReason, MemoryStore, Session};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = openai::Client::from_env()?;
-    let agent = client
-        .agent(openai::GPT_5_5)
-        .preamble("You are concise and practical.")
-        .build();
+async fn run(agent: Agent) -> Result<(), rigloop::Error> {
+    let store = MemoryStore::default();
+    let session = Session::new(agent, store.clone()).start()?;
 
-    // Use your own DurableAgentStore in production. The in-memory store is
-    // useful for tests, examples, and local prototypes.
-    let store = InMemoryDurableAgentStore::default();
-    let harness = DurableAgentHarness::new(agent, store);
+    session.follow_up("Explain the design").await?;
+    assert_eq!(session.wait_for_idle().await?, EndReason::Idle);
 
-    harness.follow_up("Explain agent loops in one paragraph.").await?;
-    harness.start()?;
-
-    let end_reason = harness.wait_for_idle().await?;
-    println!("end_reason: {end_reason:?}");
-
+    // Idle leaves the same session ready for more work.
+    session.follow_up("Give me an example").await?;
+    session.wait_for_idle().await?;
+    session.pause().await?;
+    session.stopped().await?;
     Ok(())
 }
 ```
 
-`max_turns(...)` is optional. By default rigloop uses `DEFAULT_MAX_TURNS`
-(`1_000_000`) so long tool loops are not cut off by the harness unless you add
-your own guardrail.
+Use a local/path dependency for this checkout, alongside `rig = "0.42"` and
+Tokio. `MemoryStore` is the reference implementation for examples
+and tests. Implement `Store` over a database for persistence across processes.
 
-Once started, the harness owns the manager task. Later calls to `steer`,
-`follow_up`, or `interrupt` wake the manager automatically; callers do not call
-`start()` again.
+`Session` is a builder; `start()` consumes it and returns a cloneable
+`SessionHandle`. There is one actor and one queue owner. Dropping the last
+handle cancels the task. Use `abort()` or `pause()` followed by `stopped()` for
+graceful shutdown.
 
-```rust
-use rig::message::Message;
-
-harness.steer("Keep the next answer shorter.").await?;
-harness.follow_up(Message::user("Also give me a checklist.")).await?;
-harness.interrupt("Stop that and answer this instead.").await?;
-harness.pause()?;
-
-let end_reason = harness.wait_for_idle().await?;
-```
-
-`pause()` is process-local control. It stops at the next safe turn boundary
-without appending conversation content. Durable inbox entries that have been
-submitted but not started remain unacked/submitted so a later process start can
-load and resume them; the current harness stays paused until it is dropped.
-
-The store supplies both durable inbox persistence and completed tool-result
-persistence:
-
-```rust
-use rigloop::{
-    DurableAgentFuture, DurableAgentStore, DurableInboxEntry,
-    IncrementalToolResultPersistence, PersistMessagesArgs,
-};
-
-impl IncrementalToolResultPersistence for MyStore {
-    // persist_tool_result(...)
-    // load_tool_result(...)
-}
-
-impl DurableAgentStore for MyStore {
-    fn submit_inbox_entry(&self, entry: DurableInboxEntry) -> DurableAgentFuture<()> {
-        // Insert the submitted durable signal.
-    }
-
-    fn persist_messages_and_ack(&self, args: PersistMessagesArgs) -> DurableAgentFuture<()> {
-        // Atomically append transcript messages, ACK matching inbox rows, and
-        // record args.turn_outcome when the checkpoint is a turn boundary.
-    }
-}
-```
-
-For tests, examples, and local prototypes, `InMemoryDurableAgentStore` keeps
-the same append-and-ACK shape without the store boilerplate:
-
-```rust
-use rigloop::{DurableAgentHarness, InMemoryDurableAgentStore};
-
-let store = InMemoryDurableAgentStore::default();
-let harness = DurableAgentHarness::new(agent, store.clone());
-
-harness.follow_up("start").await?;
-harness.start()?;
-harness.wait_for_idle().await?;
-
-let snapshot = store.snapshot();
-assert!(snapshot.pending_inbox_entries.is_empty());
-```
-
-See [examples/durable_inbox_ack.rs](examples/durable_inbox_ack.rs)
-for a complete in-memory example.
-
-## Durable Signals
-
-Signal methods create a `DurableInboxEntry`, tag the first user text block with
-the generated inbox id, then submit the inbox entry before forwarding it to the
-running agent or queueing it for the manager.
-
-The tag lives in the text block's `additional_params` under
-`rigloop_inbox_entry_id`. When a persisted transcript delta contains tagged
-messages, the harness includes those ids in `PersistMessagesArgs` so the store
-can atomically persist the messages and ACK the durable inbox rows in the same
-transaction.
-
-When a checkpoint is also a turn boundary, `PersistMessagesArgs::turn_outcome`
-contains the turn outcome kind, optional terminal loop reason, and provider
-usage. The outcome is part of the same durable transaction. It may be present
-even when `messages` is empty because assistant snapshots can be persisted
-before the final turn boundary records usage.
-
-By default inbox ids are harness-local monotonic strings like `inbox-1`. Use
-`with_inbox_id_generator(...)` to provide ids from your own database or id
-service. Signal messages must contain a user text block that can be tagged;
-otherwise the signal fails with `DurableAgentError::InvalidSignalMessage`.
-
-History loading remains caller-owned. Load persisted transcript messages in
-your application, repair them if needed, and pass them through `with_history`.
-If a running turn is interrupted after an assistant tool-call snapshot has been
-persisted, the harness repairs the trailing unanswered tool calls through the
-tool-result store or the default recovery text before appending the interrupt
-message, so the durable transcript remains replayable.
-
-## Low-Level Engine
-
-`AgentLoop` is the escape hatch for custom orchestration. `prompt(...)` returns
-an `AgentLoopHandle`.
-
-```rust
-use rigloop::AgentLoop;
-
-let handle = AgentLoop::new(agent).prompt(Message::user("Start."));
-
-handle.follow_up(Message::user("Also give me a checklist."))?;
-handle.steer(Message::user("Keep the next answer shorter."))?;
-handle.interrupt(Message::user("Stop that and answer this instead."))?;
-handle.resume()?;
-handle.abort()?;
-handle.pause()?;
-
-let messages = handle.state();
-let result = handle.wait().await?;
-```
-
-The queue rules are intentionally simple:
-
-| Method | Behavior |
+| Operation | Behavior |
 | --- | --- |
-| `follow_up` | Runs after the loop would otherwise become idle. Follow-ups apply one at a time. |
-| `steer` | Runs after the current agent turn. All ready steers apply together. |
-| `interrupt` | Stops the current turn, keeps only valid completed tool results, then runs the new message next. |
-| `resume` | Runs another agent turn using the current history as-is. It is a no-op while a turn is running. |
-| `abort` | Stops the loop. Completed tool results from the current turn are kept. |
-| `pause` | Stops at the next turn boundary without adding conversation content. Queued work is not drained. |
-| `state` | Returns a clone of the committed in-memory Rig message history. |
-| `wait` | Waits for the loop to finish and returns `AgentLoopResult`. |
+| `follow_up(message)` | Queue one prompt after ready steers and interrupts. |
+| `steer(message)` | Apply all ready steers together after the active turn. |
+| `interrupt(message)` | Persist the signal, cancel the active turn, close its tool batch, then run the interrupt next. Live interrupts have newest-first priority. |
+| `resume()` | Run from the last conversation message without appending it again. Coalesces queued resumes; a no-op during an active turn. |
+| `wait_for_idle()` | Wait until accepted work drains or the session stops. Multiple waiters are supported. Work accepted later can extend the wait. |
+| `pause()` | Finish the active turn, then stop. Queued durable entries remain pending. |
+| `abort()` | Cancel the active turn, preserve accepted results, then stop. |
+| `history()` | Request a snapshot while the actor is alive. May include a recoverable tool-call tail. |
+| `subscribe()` | Receive ordered observations; receiver lag is explicit. |
 
-Dropping `AgentLoopHandle`, or cancelling a pending `wait()`, aborts the
-running task. Use `abort()` followed by `wait()` when you want the loop to stop
-through the normal commit path and keep completed tool results from the active
-turn.
+Only nonempty user messages without tool-result blocks may be submitted as
+signals. Multimodal content is supported. Queue capacity defaults to 256;
+`queue_capacity` bounds pending work, command intake and idle waiters. Commands
+backpressure at intake, and pending-work overload returns `Error::QueueFull`
+before submission to storage. Controls are applied between bounded storage
+operations. Tools execute serially through Rig's default runner.
 
-## Timeouts
+## Durability and recovery
 
-Set turn and loop wall-clock timeouts on either layer:
+A `Store` belongs to **one conversation with one active writer**. Its four
+operations are `submit`, `commit`, `save_tool_result` and `load_tool_result`.
+Loading the journal and pending inbox remains application-owned.
 
-```rust
-use std::time::Duration;
+A commit contains a UUID, expected journal position, appendable messages, inbox
+IDs to ACK, and an optional turn outcome. The store must atomically append,
+ACK and record the outcome. ACK means the signal is incorporated into the
+journal, not that a model completed the user's request. Signal IDs stay outside
+provider messages; default IDs are UUIDs, and applications may supply their own
+`InboxEntry.id`.
 
-let harness = DurableAgentHarness::new(agent, store)
-    .turn_timeout(Duration::from_secs(30))
-    .loop_timeout(Duration::from_secs(120));
+Assistant messages are checkpointed from Rig's canonical model-turn hook before
+tools execute. Accepted tool results are persisted individually, then appended
+as one complete user result batch in model-call order. Interruption fills missing
+results with an explicit unknown-completion message. Recovery preserves the
+provider's call and item IDs; it never silently drops unrelated results.
 
-let agent_loop = AgentLoop::new(agent)
-    .turn_timeout(Duration::from_secs(30))
-    .loop_timeout(Duration::from_secs(120));
-```
-
-`turn_timeout` applies to each active agent turn and resets between turns.
-`loop_timeout` applies to the whole loop lifetime, including idle time while the
-low-level handle is still alive. If both can fire during a turn, the earlier
-deadline wins.
-
-Timeouts during an active turn commit only valid completed tool-call/tool-result
-pairs. Active-turn timeouts emit `AgentLoopEvent::TurnTimedOut`; loop timeouts
-while idle end the loop without an extra transcript commit.
-
-## Events and Checkpoints
-
-On the managed harness, checkpoint handlers run after rigloop's internal
-durability work. Handler errors fail the managed run and are returned from
-`wait_for_idle()`.
+The journal may end with an unanswered assistant batch after a crash or hard
+cancellation. A fresh session restores saved receipts and appends the missing
+result batch before the next request. A pre-existing **partial user result
+batch**, orphan, duplicate or conflicting identity is rejected. Normalize such
+stored history atomically in the application before starting.
 
 ```rust
-let harness = DurableAgentHarness::new(agent, store)
-    .with_checkpoint_handler(|checkpoint| async move {
-        match checkpoint {
-            rigloop::DurableCheckpoint::TurnBoundary(turn) => {
-                println!(
-                    "committed {} messages, input_tokens={:?}",
-                    turn.new_messages.len(),
-                    turn.usage.map(|usage| usage.input_tokens),
-                );
-            }
-            rigloop::DurableCheckpoint::AssistantMessageFinished(context) => {
-                println!(
-                    "assistant snapshot: {} messages, ending={}",
-                    context.new_messages.len(),
-                    context.end_reason.is_some(),
-                );
-            }
-        }
-
-        Ok::<_, std::convert::Infallible>(
-            rigloop::DurableCheckpointAction::Continue,
-        )
-    });
-```
-
-Use `context.end_reason` or `turn.end_reason` to avoid maintenance work that is
-only useful before another turn. For compaction, prefer
-`DurableCheckpoint::TurnBoundary`; assistant snapshots are earlier recovery
-points and can temporarily contain unanswered tool calls.
-
-Use low-level event subscription, or `with_event_observer(...)` on the managed
-harness, when you need raw stream forwarding:
-
-```rust
-let mut events = handle.subscribe();
-
-while let Ok(event) = events.recv().await {
-    match event {
-        rigloop::AgentLoopEvent::Rig(item) => {
-            // Full Rig stream granularity, including text deltas and tool deltas.
-        }
-        rigloop::AgentLoopEvent::AssistantMessageFinished { messages, .. } => {
-            // A partial assistant snapshot is available.
-        }
-        rigloop::AgentLoopEvent::TurnCommitted { messages } => {
-            // A valid append batch was committed.
-        }
-        rigloop::AgentLoopEvent::LoopEnded { end_reason } => break,
-        rigloop::AgentLoopEvent::LoopFailed { error } => break,
-        _ => {}
-    }
+async fn restart(agent: rig::agent::Agent, store: rigloop::MemoryStore) -> Result<(), rigloop::Error> {
+use rigloop::Session;
+let saved = store.snapshot(); // Load from your database in production.
+let session = Session::new(agent, store)
+    .pending(saved.pending()) // Already stored entries; no resubmit or retag.
+    .history(saved.history)
+    .start()?;
+session.wait_for_idle().await?;
+Ok(())
 }
 ```
 
-`LoopEnded` is emitted for normal loop outcomes, including provider/tool
-outcomes represented as `EndReason`s such as `ContextFull` or `ApiError`.
-`LoopFailed` is emitted when the runner itself returns an `AgentLoopError`,
-such as invalid Rig message history shape/order.
+`submit(entry)` is idempotent for the same ID and contents. A conflicting reuse
+must fail. Cancellation after command enqueue does not cancel the actor's
+submission. Retain the same entry for retries, or reload pending entries from
+the store; calling `follow_up` again creates a different signal.
 
-## History and Repair
+A storage error or timeout can follow a successful durable write.
+`Error::CommitUncertain` contains the exact commit to reconcile/retry;
+`Error::ToolWriteUncertain` contains the receipt key and payload. Stop and
+resolve these against the store, then load a fresh session. The reference store
+checks idempotency before position and rejects conflicting retries. Rigloop
+never claims exactly-once external tool side effects and never automatically
+re-executes missing tools.
 
-Seed managed or low-level sessions with `with_history(...)`:
+## Context and compaction
 
-```rust
-let harness = DurableAgentHarness::new(agent, store)
-    .with_history(existing_messages);
+Use `context::ContextPolicy(policy)` as an agent hook for upstream sliding or
+token windows, or `context::CompactingContext::new(id, policy, compactor)` for
+Rig's rolling compaction. Both run before every model request, including tool
+rounds. Errors stop the run instead of silently restoring oversized context.
 
-let loop_from_history = AgentLoop::new(agent)
-    .with_history(existing_messages)
-    .resume()?;
+```rust,ignore
+use rig_memory::SlidingWindowMemory;
+use rigloop::context::ContextPolicy;
+
+let agent = rig::agent::AgentBuilder::new(model)
+    .preamble("Persistent application instructions")
+    .add_hook(ContextPolicy(SlidingWindowMemory::last_messages(20)))
+    .build();
 ```
 
-`resume()` validates that the committed Rig message history is usable before
-starting another model call. Invalid tool-call ordering is rejected before it
-can be sent to a provider.
+The durable journal remains complete. The current prompt must survive unchanged
+and all retained tool calls must still have matching results. Put persistent
+application instructions in the agent's preamble; system messages in history
+are subject to the chosen policy. Budget the preamble, tools, summary and output
+headroom separately from the retained window.
 
-Histories loaded from partial assistant-message persistence are repaired by
-default when an assistant tool call is missing a matching tool result. Rigloop
-inserts a recovery tool result that says `Recovery message: no result was recorded for this tool call. It may or may not have completed.`;
-other invalid message ordering still fails validation.
+Implement Rig's async `Compactor` to choose the summarization prompt, model and
+artifact. [The compaction example](examples/durable_compaction.rs) demonstrates a
+custom prompt with a separate summarizer and output limit. The summary is a
+process-local derived cache, rebuilt from the full journal on restart. A
+side-effectful compactor should deduplicate by conversation ID and input content.
+Use one `CompactingContext` instance per conversation; do not share an agent
+carrying that hook between conversations.
 
-Use the same repair logic directly when you need to normalize persisted history
-before handing it to another boundary:
+Configure Anthropic caching on the Rig model before building the agent. The
+session preserves `with_automatic_caching`, `with_prompt_caching`,
+`with_automatic_caching_1h` and `with_static_prefix_cache_ttl`. Tests capture the
+actual streaming request and verify a one-hour tools/system prefix with either
+a manual or automatic conversation-tail marker. Arbitrary historical text-block
+breakpoints still require upstream provider support or a provider adapter.
 
-```rust
-use rigloop::{
-    repair_unanswered_tool_calls,
-    DEFAULT_UNANSWERED_TOOL_CALL_REPAIR_MESSAGE,
-};
+## Deadlines, hooks and observations
 
-let repaired = repair_unanswered_tool_calls(
-    loaded_messages,
-    DEFAULT_UNANSWERED_TOOL_CALL_REPAIR_MESSAGE,
-);
+`turn_timeout` covers the active model/tool/hook work, including compaction.
+`loop_timeout` covers the session lifetime, including startup recovery and idle.
+Neither is enabled by default. `io_timeout` defaults to 30 seconds and bounds
+storage operations. During active work, the earlier execution/storage deadline
+wins. Graceful cancellation gets one additional `io_timeout` allowance to repair
+and finalize. An unfinished write is reported as uncertain; it is not silently
+retried or reported as successful. Async deadlines require cooperative futures;
+blocking synchronous hook/tool code must be offloaded by the application.
+
+Configured Rig hooks run before the final durability hook. Result rewrites are
+persisted in their accepted presentation. Results rejected by earlier hooks are
+unknown for recovery purposes; rejected output is not exposed. Ordinary hooks,
+skips, rewrites and repeat retries compose with the session.
+
+Rig 0.42 suppresses canonical callbacks for invalid-tool repair/skip recovery,
+and retry feedback can introduce uncheckpointed transcript records. Those paths
+are rejected before dispatch or the next model request; they need an upstream
+checkpoint extension. Rig conversation-memory loading/appending is disabled in
+the session because its append errors are logged rather than propagated. Use
+context hooks and the explicit `Store` transaction contract here.
+
+`Event::Rig` forwards Rig stream items, and `Event::RigError` preserves structured
+runtime/provider errors. These are observations; use `Event::Committed` as the
+durable boundary. Slow consumers cannot stall the session; `recv()` reports
+`Lagged` when the 1,024-event buffer overflows. Turn outcomes record structured
+finish reasons where Rig supplies them. Usage is `None` when metrics are missing
+or a provider call fails; reported aggregates cover completed calls only.
+
+## Validation
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo test --doc
+cargo run --example durable_inbox_ack
+cargo run --example durable_compaction
+cargo test --release --lib append_bookkeeping_scaling -- --ignored --nocapture
 ```
 
-If you record completed tool results separately, use
-`repair_unanswered_tool_calls_with_persistence(...)` so repair can restore those
-results before falling back to synthetic recovery text.
-
-## End Reasons
-
-`AgentLoopResult` includes `end_reason`, `history`, and `last_response`.
-`DurableAgentHarness::wait_for_idle()` returns the latest `EndReason`.
-
-Known end reasons include:
-
-| Reason | Meaning |
-| --- | --- |
-| `Idle` | The prompt and all queued work completed. |
-| `NoRun` | A managed wait reached idle without starting or resuming an agent turn. |
-| `Aborted` | The caller aborted the loop. |
-| `Paused` | The caller paused the loop at a safe turn boundary. |
-| `AbortedByHook` | A turn hook or durable checkpoint handler stopped the loop after a commit boundary. |
-| `ContentFilter` | The provider refused or filtered the request/response. |
-| `ContextFull` | The provider rejected the request because the context was too large. |
-| `Length` | The provider stopped due to an output limit. |
-| `MaxTurns` | Rig hit the configured multi-turn tool-call limit. |
-| `TurnTimedOut` | The active turn exceeded the configured wall-clock timeout. |
-| `LoopTimedOut` | The loop exceeded the configured wall-clock timeout. |
-| `ToolError` | Tool execution failed. |
-| `ApiError` | The provider/client returned an API error. |
-
-## Inspiration
-
-The managed API shape is inspired by
-[`@earendil-works/pi-agent-core`](https://github.com/earendil-works/pi/tree/main/packages/agent):
-stateful agent control, event streaming, steering, follow-ups, durable inboxes,
-and hooks. This crate keeps that idea intentionally small and Rig-native.
+[REVIEW_PLAN.md](REVIEW_PLAN.md) tracks the implementation and retained upstream
+limits. [IMPLEMENTATION_EVIDENCE.md](IMPLEMENTATION_EVIDENCE.md) records validation
+and the deliberately narrow bookkeeping benchmark.
