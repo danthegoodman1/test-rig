@@ -1,15 +1,18 @@
 use super::*;
 use rig::{
     agent::{
-        Agent, AgentBuilder, AgentHook,
-        hook::{
-            HookContext, ModelTurnAction, ModelTurnFinished, ToolCall, ToolCallAction,
-            ToolResultAction, ToolResultEvent,
-        },
+        Agent, AgentBuilder, AgentHook, DispatchAction, DispatchEvent, HookContext,
+        InvalidToolCallAction, InvalidToolCallContext, ModelTurnAction, ModelTurnFinished,
+        OutcomeAction, OutcomeEvent,
     },
-    message::{AssistantContent, Message, ToolResult, ToolResultContent, UserContent},
+    completion::CompletionRequest,
+    message::{
+        AssistantContent, AssistantMessage, CallId, Message, ToolCall, ToolFunction, ToolName,
+        ToolResult, ToolResultContent, UserContent,
+    },
     test_utils::{MockAddTool, MockCompletionModel, MockStreamEvent as E},
 };
+use rig_memory::recent::LastMessages;
 use std::{
     sync::{
         Arc,
@@ -59,15 +62,27 @@ fn text(message: &Message) -> String {
                 _ => None,
             })
             .collect(),
-        Message::Assistant { content, .. } => content
-            .iter()
-            .filter_map(|c| match c {
-                AssistantContent::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect(),
+        Message::Assistant(turn) => turn.text(),
         Message::System { content } => content.clone(),
     }
+}
+fn sent(request: &CompletionRequest) -> Vec<Message> {
+    request.chat_history.iter().map(|m| (**m).clone()).collect()
+}
+fn call(id: &str) -> ToolCall {
+    ToolCall::from_wire(
+        id,
+        ToolFunction::new(ToolName::new("add").unwrap(), serde_json::json!({})),
+    )
+}
+fn calls_turn(calls: &[ToolCall]) -> Message {
+    Message::Assistant(AssistantMessage::new(
+        calls
+            .iter()
+            .cloned()
+            .map(AssistantContent::ToolCall)
+            .collect(),
+    ))
 }
 async fn idle(session: &SessionHandle) -> EndReason {
     tokio::time::timeout(Duration::from_secs(3), session.wait_for_idle())
@@ -79,7 +94,6 @@ async fn idle(session: &SessionHandle) -> EndReason {
 #[tokio::test]
 async fn canonical_chunks_metadata_and_no_duplicate_commits() {
     let model = MockCompletionModel::from_stream_turns([vec![
-        E::message_id("msg-1"),
         E::text("hello "),
         E::text("world"),
         E::final_response_with_default_usage(),
@@ -90,11 +104,11 @@ async fn canonical_chunks_metadata_and_no_duplicate_commits() {
     assert_eq!(idle(&session).await, EndReason::Idle);
     let snapshot = store.snapshot();
     assert_eq!(snapshot.history.len(), 2);
-    let Message::Assistant { id, content } = &snapshot.history[1] else {
+    let Message::Assistant(turn) = &snapshot.history[1] else {
         panic!()
     };
-    assert_eq!(id.as_deref(), Some("msg-1"));
-    assert_eq!(content.len(), 1);
+    assert!(turn.origin.is_some());
+    assert_eq!(turn.content.len(), 1);
     assert_eq!(text(&snapshot.history[1]), "hello world");
     assert_eq!(snapshot.acked_ids.len(), 1);
     assert!(snapshot.pending().is_empty());
@@ -125,10 +139,9 @@ async fn grouped_calls_results_and_provider_identity_round_trip() {
         .zip(results(&snapshot.history))
     {
         assert_eq!(call.id, result.call);
-        assert_eq!(call.provider, result.provider);
         assert_eq!(result.name, "add");
     }
-    assert_eq!(model.requests()[1].chat_history, snapshot.history[..3]);
+    assert_eq!(sent(&model.requests()[1]), snapshot.history[..3]);
     validate_history(&snapshot.history).unwrap();
 }
 
@@ -139,15 +152,15 @@ struct Gate {
     stop: bool,
 }
 impl AgentHook for Gate {
-    async fn on_tool_call(&self, _: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
-        if event.tool_call_id == Some("call_b") {
+    async fn on_dispatch(&self, _: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+        if event.call_id == Some(&CallId::from_wire("call_b")) {
             self.reached.notify_one();
             if self.stop {
-                return ToolCallAction::Stop("blocked B".into());
+                return DispatchAction::stop("blocked B");
             }
             self.release.notified().await;
         }
-        ToolCallAction::Run
+        DispatchAction::Proceed
     }
 }
 fn gate() -> Gate {
@@ -301,32 +314,11 @@ fn model_for_resume() -> MockCompletionModel {
 
 #[tokio::test]
 async fn incomplete_or_corrupt_stored_result_batch_is_rejected_without_model_io() {
-    let call_a = rig::message::ToolCall::from_wire(
-        "a",
-        rig::message::ToolFunction {
-            name: "add".into(),
-            arguments: serde_json::json!({}),
-        },
-    );
-    let call_b = rig::message::ToolCall::from_wire(
-        "b",
-        rig::message::ToolFunction {
-            name: "add".into(),
-            arguments: serde_json::json!({}),
-        },
-    );
-    let assistant = Message::Assistant {
-        id: None,
-        content: vec![
-            AssistantContent::ToolCall(call_a),
-            AssistantContent::ToolCall(call_b),
-        ],
-    };
+    let call_a = call("a");
+    let assistant = calls_turn(&[call_a.clone(), call("b")]);
     let partial = Message::User {
-        content: vec![UserContent::tool_result_from_wire(
-            "a",
-            "add",
-            vec![ToolResultContent::text("ok")],
+        content: vec![UserContent::ToolResult(
+            call_a.result(vec![ToolResultContent::text("ok")]),
         )],
     };
     let model = model(1);
@@ -397,9 +389,7 @@ async fn context_policy_runs_inside_tool_loop_without_rewriting_journal() {
     let session = Session::new(
         AgentBuilder::new(model.clone())
             .tool(MockAddTool)
-            .add_hook(context::ContextPolicy(
-                rig_memory::SlidingWindowMemory::last_messages(2),
-            ))
+            .add_hook(context::ContextPolicy(LastMessages(2)))
             .build(),
         store.clone(),
     )
@@ -412,18 +402,12 @@ async fn context_policy_runs_inside_tool_loop_without_rewriting_journal() {
     validate_history(&store.snapshot().history).unwrap();
 }
 
-struct BadPolicy;
-impl rig_memory::MemoryPolicy for BadPolicy {
-    fn apply(&self, _: Vec<Message>) -> Result<Vec<Message>, rig_memory::MemoryError> {
-        Err(rig_memory::MemoryError::Internal("bad policy".into()))
-    }
-}
 #[tokio::test]
-async fn policy_error_stops_before_provider_request() {
+async fn policy_without_the_prompt_stops_before_provider_request() {
     let model = model(1);
     let session = Session::new(
         AgentBuilder::new(model.clone())
-            .add_hook(context::ContextPolicy(BadPolicy))
+            .add_hook(context::ContextPolicy(LastMessages(0)))
             .build(),
         MemoryStore::default(),
     )
@@ -562,8 +546,8 @@ async fn pause_latches_at_boundary_and_leaves_pending_inbox() {
 
 struct RewriteResults;
 impl AgentHook for RewriteResults {
-    async fn on_tool_result(&self, _: &HookContext, _: ToolResultEvent<'_>) -> ToolResultAction {
-        ToolResultAction::rewrite("redacted")
+    async fn on_outcome(&self, _: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        OutcomeAction::rewrite_tool_result(&event, "redacted")
     }
 }
 #[tokio::test]
@@ -588,7 +572,8 @@ async fn durable_receipts_use_accepted_rewritten_presentation() {
     for result in results(&snapshot.history) {
         assert_eq!(result.content, vec![ToolResultContent::text("redacted")]);
     }
-    assert_eq!(model.requests()[1].chat_history, snapshot.history[..3]);
+    assert_eq!(snapshot.tool_results.len(), 2);
+    assert_eq!(sent(&model.requests()[1]), snapshot.history[..3]);
 }
 struct RetryOnce;
 impl AgentHook for RetryOnce {
@@ -616,11 +601,73 @@ async fn rejected_model_attempt_is_not_persisted() {
     .unwrap();
     session.follow_up("start").await.unwrap();
     assert_eq!(idle(&session).await, EndReason::Idle);
-    assert_eq!(
-        store.snapshot().history,
-        vec![Message::user("start"), Message::assistant("answer 1")]
-    );
+    let history = store.snapshot().history;
+    assert_eq!(history.len(), 2);
+    assert_eq!(text(&history[1]), "answer 1");
     assert_eq!(model.request_count(), 2);
+}
+
+#[tokio::test]
+async fn malformed_tool_arguments_commit_rigs_feedback_result() {
+    let model = MockCompletionModel::from_stream_turns([
+        vec![
+            E::tool_call("fc_a", "add", serde_json::json!([1])).with_call_id("call_a"),
+            E::final_response_with_default_usage(),
+        ],
+        vec![E::text("done"), E::final_response_with_default_usage()],
+    ]);
+    let store = MemoryStore::default();
+    let session = Session::new(
+        AgentBuilder::new(model.clone()).tool(MockAddTool).build(),
+        store.clone(),
+    )
+    .start()
+    .unwrap();
+    session.follow_up("start").await.unwrap();
+    assert_eq!(idle(&session).await, EndReason::Idle);
+    let snapshot = store.snapshot();
+    let results = results(&snapshot.history);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_error);
+    assert!(snapshot.tool_results.is_empty());
+    assert_eq!(sent(&model.requests()[1]), snapshot.history[..3]);
+}
+
+struct SkipB;
+impl AgentHook for SkipB {
+    async fn on_dispatch(&self, _: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+        if event.call_id == Some(&CallId::from_wire("call_b")) {
+            DispatchAction::skip("not allowed")
+        } else {
+            DispatchAction::Proceed
+        }
+    }
+}
+#[tokio::test]
+async fn hook_skip_commits_rigs_skipped_result() {
+    let model = MockCompletionModel::from_stream_turns([
+        tool_turn(),
+        vec![E::text("done"), E::final_response_with_default_usage()],
+    ]);
+    let store = MemoryStore::default();
+    let session = Session::new(
+        AgentBuilder::new(model.clone())
+            .tool(MockAddTool)
+            .add_hook(SkipB)
+            .build(),
+        store.clone(),
+    )
+    .start()
+    .unwrap();
+    session.follow_up("start").await.unwrap();
+    assert_eq!(idle(&session).await, EndReason::Idle);
+    let snapshot = store.snapshot();
+    let results = results(&snapshot.history);
+    assert!(!results[0].is_error);
+    assert!(results[1].is_error);
+    assert!(format!("{:?}", results[1].content).contains("not allowed"));
+    assert_eq!(snapshot.tool_results.len(), 2);
+    assert_eq!(sent(&model.requests()[1]), snapshot.history[..3]);
 }
 
 #[tokio::test]
@@ -708,7 +755,7 @@ async fn resume_does_not_duplicate_the_last_message_and_invalid_resume_is_local(
     resumed.resume().await.unwrap();
     assert_eq!(idle(&resumed).await, EndReason::Idle);
     assert_eq!(store.snapshot().history.len(), history.len() + 1);
-    assert_eq!(model.requests()[0].chat_history, history);
+    assert_eq!(sent(&model.requests()[0]), history);
 }
 
 #[tokio::test(start_paused = true)]
@@ -787,24 +834,20 @@ async fn uncertain_tool_write_restarts_without_losing_the_real_result() {
 struct TestCompactor {
     inputs: Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
 }
-impl rig_memory::Compactor for TestCompactor {
-    type Artifact = Message;
-    fn compact<'a>(
-        &'a self,
-        _: &'a str,
-        evicted: &'a [Message],
-        carry: Option<&'a Message>,
-    ) -> rig::wasm_compat::WasmBoxedFuture<'a, Result<Message, rig_memory::MemoryError>> {
-        Box::pin(async move {
-            self.inputs.lock().unwrap().push(evicted.to_vec());
-            let mut summary = carry.map(text).unwrap_or_default();
-            for message in evicted {
-                summary.push_str(&text(message));
-            }
-            Ok(Message::system(format!(
-                "Remember project decisions: {summary}"
-            )))
-        })
+impl context::Compactor for TestCompactor {
+    async fn compact(
+        &self,
+        evicted: &[Message],
+        previous: Option<&Message>,
+    ) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
+        self.inputs.lock().unwrap().push(evicted.to_vec());
+        let mut summary = previous.map(text).unwrap_or_default();
+        for message in evicted {
+            summary.push_str(&text(message));
+        }
+        Ok(Message::system(format!(
+            "Remember project decisions: {summary}"
+        )))
     }
 }
 #[tokio::test]
@@ -814,8 +857,7 @@ async fn custom_compactor_runs_each_boundary_and_rebuilds_after_restart() {
     let make_agent = |model: MockCompletionModel| {
         AgentBuilder::new(model)
             .add_hook(context::CompactingContext::new(
-                "conversation",
-                rig_memory::SlidingWindowMemory::last_messages(1),
+                LastMessages(1),
                 TestCompactor {
                     inputs: inputs.clone(),
                 },
@@ -835,7 +877,7 @@ async fn custom_compactor_runs_each_boundary_and_rebuilds_after_restart() {
         4
     );
     assert_eq!(first_model.requests()[2].chat_history.len(), 2);
-    assert!(text(&first_model.requests()[2].chat_history[0]).contains("decision A"));
+    assert!(text(&sent(&first_model.requests()[2])[0]).contains("decision A"));
     session.pause().await.unwrap();
     session.stopped().await.unwrap();
     let before = store.snapshot().history;
@@ -846,7 +888,7 @@ async fn custom_compactor_runs_each_boundary_and_rebuilds_after_restart() {
         .unwrap();
     resumed.follow_up("continue").await.unwrap();
     idle(&resumed).await;
-    assert!(text(&new_model.requests()[0].chat_history[0]).contains("decision A"));
+    assert!(text(&sent(&new_model.requests()[0])[0]).contains("decision A"));
     assert_eq!(store.snapshot().history[..before.len()], before);
 }
 
@@ -910,8 +952,9 @@ impl rig::http_client::HttpClientExt for CacheHttp {
 #[tokio::test]
 async fn anthropic_cache_controls_reach_the_session_wire_request() {
     use rig::{
-        client::CompletionClient,
-        providers::anthropic::{self, completion::CacheTtl},
+        Model,
+        completion::{CacheRetention, GenerationOptions},
+        providers::anthropic::{AnthropicConfig, completion::CacheTtl},
     };
     let sse = concat!(
         "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
@@ -929,28 +972,23 @@ async fn anthropic_cache_controls_reach_the_session_wire_request() {
                 bytes::Bytes::from_static(sse.as_bytes()),
             )]),
         };
-        let client = anthropic::Client::builder()
-            .api_key("test-key")
-            .http_client(http)
-            .build()
-            .unwrap();
-        let model = client
-            .completion_model("claude-sonnet-4-6")
+        let wire = AnthropicConfig::new("test-key")
+            .completion("claude-sonnet-4-6")
+            .with_prompt_caching()
             .with_static_prefix_cache_ttl(CacheTtl::OneHour);
-        let model = if automatic {
-            model.with_automatic_caching()
+        let builder = AgentBuilder::new(Model::new(wire, http))
+            .preamble("Static instructions")
+            .tool(MockAddTool);
+        // A request cache retention hands the moving message breakpoint to
+        // the provider's automatic top-level marker.
+        let builder = if automatic {
+            builder.options(GenerationOptions::default().cache(CacheRetention::Short))
         } else {
-            model.with_prompt_caching()
+            builder
         };
-        let session = Session::new(
-            AgentBuilder::new(model)
-                .preamble("Static instructions")
-                .tool(MockAddTool)
-                .build(),
-            MemoryStore::default(),
-        )
-        .start()
-        .unwrap();
+        let session = Session::new(builder.build(), MemoryStore::default())
+            .start()
+            .unwrap();
         session.follow_up("hello").await.unwrap();
         assert_eq!(idle(&session).await, EndReason::Idle);
         let requests = requests.lock().unwrap();
@@ -976,13 +1014,15 @@ impl AgentHook for RecoveredToolObserver {
     async fn on_invalid_tool_call(
         &self,
         _: &HookContext,
-        _: &rig::agent::hook::InvalidToolCallContext,
-    ) -> Option<rig::agent::hook::InvalidToolCallAction> {
-        Some(rig::agent::hook::InvalidToolCallAction::repair("add"))
+        _: &InvalidToolCallContext,
+    ) -> Option<InvalidToolCallAction> {
+        Some(InvalidToolCallAction::repair("add"))
     }
-    async fn on_tool_result(&self, _: &HookContext, _: ToolResultEvent<'_>) -> ToolResultAction {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        ToolResultAction::Keep
+    async fn on_outcome(&self, _: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        if event.tool_result().is_some() {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        OutcomeAction::Proceed
     }
 }
 #[tokio::test]
@@ -1098,44 +1138,51 @@ async fn store_rejects_double_acks_and_stale_or_conflicting_transactions() {
 }
 
 #[test]
-fn validator_rejects_orphans_duplicate_results_and_provider_metadata_conflicts() {
-    let call = rig::message::ToolCall::from_wire(
-        "a",
-        rig::message::ToolFunction {
-            name: "add".into(),
-            arguments: serde_json::json!({}),
-        },
-    );
-    let assistant = Message::Assistant {
-        id: None,
-        content: vec![AssistantContent::ToolCall(call.clone())],
-    };
-    let result = ToolResult {
-        call: call.id,
-        provider: call.provider,
-        name: "add".into(),
-        content: vec![ToolResultContent::text("ok")],
-    };
-    let user = |result: ToolResult| Message::User {
-        content: vec![UserContent::ToolResult(result)],
-    };
-    assert!(validate_history(&[user(result.clone())]).is_err());
+fn validator_rejects_orphans_duplicates_split_and_mixed_batches() {
+    let a = call("a");
+    let assistant = calls_turn(std::slice::from_ref(&a));
+    let result = a.result(vec![ToolResultContent::text("ok")]);
+    let user = |content: Vec<UserContent>| Message::User { content };
+    let answer = UserContent::ToolResult(result.clone());
+    assert!(validate_history(&[user(vec![answer.clone()])]).is_err());
     assert!(
         validate_history(&[
             assistant.clone(),
-            Message::User {
-                content: vec![
-                    UserContent::ToolResult(result.clone()),
-                    UserContent::ToolResult(result.clone())
-                ]
-            }
+            user(vec![answer.clone(), answer.clone()])
         ])
         .is_err()
     );
-    let mut wrong = result.clone();
-    wrong.provider = None;
-    assert!(validate_history(&[assistant.clone(), user(wrong)]).is_err());
-    validate_history(&[assistant, user(result)]).unwrap();
+    assert!(
+        validate_history(&[
+            assistant.clone(),
+            user(vec![answer.clone(), UserContent::text("aside")])
+        ])
+        .is_err()
+    );
+    let b = call("b");
+    assert!(
+        validate_history(&[
+            calls_turn(&[a.clone(), b.clone()]),
+            user(vec![answer.clone()]),
+            user(vec![UserContent::ToolResult(
+                b.result(vec![ToolResultContent::text("ok")])
+            )]),
+        ])
+        .is_err()
+    );
+    assert!(validate_history(&[calls_turn(&[a.clone(), a.clone()])]).is_err());
+    let empty = ToolResult {
+        content: Vec::new(),
+        ..result.clone()
+    };
+    assert!(
+        validate_history(&[
+            assistant.clone(),
+            user(vec![UserContent::ToolResult(empty)])
+        ])
+        .is_err()
+    );
+    validate_history(&[assistant, user(vec![answer])]).unwrap();
 }
 
 #[tokio::test]
@@ -1144,9 +1191,7 @@ async fn compaction_preserves_configured_system_preamble() {
     let session = Session::new(
         AgentBuilder::new(model.clone())
             .preamble("Persistent application instructions")
-            .add_hook(context::ContextPolicy(
-                rig_memory::SlidingWindowMemory::last_messages(1),
-            ))
+            .add_hook(context::ContextPolicy(LastMessages(1)))
             .build(),
         MemoryStore::default(),
     )
@@ -1158,7 +1203,7 @@ async fn compaction_preserves_configured_system_preamble() {
     }
     for request in model.requests() {
         assert_eq!(
-            request.chat_history.first(),
+            sent(&request).first(),
             Some(&Message::system("Persistent application instructions"))
         );
     }
@@ -1177,10 +1222,10 @@ async fn reasoning_deltas_use_rigs_canonical_assembly() {
     session.follow_up("start").await.unwrap();
     idle(&session).await;
     let snapshot = store.snapshot();
-    let Message::Assistant { content, .. } = &snapshot.history[1] else {
+    let Message::Assistant(turn) = &snapshot.history[1] else {
         panic!()
     };
-    assert!(format!("{content:?}").contains("first second"));
+    assert!(format!("{:?}", turn.content).contains("first second"));
     assert_eq!(snapshot.history.len(), 2);
 }
 
@@ -1299,17 +1344,7 @@ impl Store for BlockedRecovery {
 }
 #[tokio::test(start_paused = true)]
 async fn recovery_reads_are_bounded_before_any_model_request() {
-    let call = rig::message::ToolCall::from_wire(
-        "a",
-        rig::message::ToolFunction {
-            name: "add".into(),
-            arguments: serde_json::json!({}),
-        },
-    );
-    let history = vec![Message::Assistant {
-        id: None,
-        content: vec![AssistantContent::ToolCall(call)],
-    }];
+    let history = vec![calls_turn(&[call("a")])];
     for loop_limit in [false, true] {
         let store = MemoryStore::default();
         store
@@ -1347,21 +1382,17 @@ struct BlockingCompactor {
     release: Arc<Notify>,
     calls: AtomicUsize,
 }
-impl rig_memory::Compactor for BlockingCompactor {
-    type Artifact = Message;
-    fn compact<'a>(
-        &'a self,
-        id: &'a str,
-        evicted: &'a [Message],
-        carry: Option<&'a Message>,
-    ) -> rig::wasm_compat::WasmBoxedFuture<'a, Result<Message, rig_memory::MemoryError>> {
-        Box::pin(async move {
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                self.started.notify_one();
-                self.release.notified().await;
-            }
-            self.inner.compact(id, evicted, carry).await
-        })
+impl context::Compactor for BlockingCompactor {
+    async fn compact(
+        &self,
+        evicted: &[Message],
+        previous: Option<&Message>,
+    ) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.compact(evicted, previous).await
     }
 }
 #[tokio::test]
@@ -1380,11 +1411,7 @@ async fn follow_up_is_accepted_while_compaction_is_running() {
     let store = MemoryStore::default();
     let session = Session::new(
         AgentBuilder::new(model.clone())
-            .add_hook(context::CompactingContext::new(
-                "one",
-                rig_memory::SlidingWindowMemory::last_messages(1),
-                compactor,
-            ))
+            .add_hook(context::CompactingContext::new(LastMessages(1), compactor))
             .build(),
         store.clone(),
     )

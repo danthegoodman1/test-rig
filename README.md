@@ -4,8 +4,8 @@ A small durable session around [Rig](https://github.com/0xPlaygrounds/rig).
 
 Rig owns model calls, streaming, canonical assistant messages and tool execution.
 Rigloop owns one session queue, durable inbox ACKs, append-only checkpoints and
-recovery of accepted tool results. Context policies and compaction use Rig's
-memory crate. The runtime and memory integrations use Rig 0.42.
+recovery of accepted tool results. Context windows use Rig's memory crate. The
+runtime and memory integrations use Rig 0.45.
 
 ## A session
 
@@ -29,7 +29,7 @@ async fn run(agent: Agent) -> Result<(), rigloop::Error> {
 }
 ```
 
-Use a local/path dependency for this checkout, alongside `rig = "0.42"` and
+Use a local/path dependency for this checkout, alongside `rig = "0.45"` and
 Tokio. `MemoryStore` is the reference implementation for examples
 and tests. Implement `Store` over a database for persistence across processes.
 
@@ -71,16 +71,22 @@ provider messages; default IDs are UUIDs, and applications may supply their own
 `InboxEntry.id`.
 
 Assistant messages are checkpointed from Rig's canonical model-turn hook before
-tools execute. Accepted tool results are persisted individually, then appended
-as one complete user result batch in model-call order. Interruption fills missing
-results with an explicit unknown-completion message. Recovery preserves the
-provider's call and item IDs; it never silently drops unrelated results.
+tools execute. Each tool outcome is persisted as a receipt before Rig advances.
+Once Rig commits a batch, the session appends it as one user message in
+model-call order, exactly as Rig holds it, including hook skips and Rig's
+feedback for malformed arguments. Before every model request the journal must
+match Rig's transcript, and each finished run must match Rig's final transcript.
+Interruption fills missing results with an explicit unknown-completion error
+result. Recovery preserves call IDs and provider items; it never silently drops
+unrelated results.
 
 The journal may end with an unanswered assistant batch after a crash or hard
 cancellation. A fresh session restores saved receipts and appends the missing
-result batch before the next request. A pre-existing **partial user result
-batch**, orphan, duplicate or conflicting identity is rejected. Normalize such
-stored history atomically in the application before starting.
+result batch before the next request. Every other tool batch must be answered by
+the next message: one user message holding exactly its results and nothing
+else. A pre-existing **partial or split result batch**, orphan, duplicate or
+empty result is rejected. Normalize such stored history atomically in the
+application before starting.
 
 ```rust
 async fn restart(agent: rig::agent::Agent, store: rigloop::MemoryStore) -> Result<(), rigloop::Error> {
@@ -110,41 +116,45 @@ re-executes missing tools.
 
 ## Context and compaction
 
-Use `context::ContextPolicy(policy)` as an agent hook for upstream sliding or
-token windows, or `context::CompactingContext::new(id, policy, compactor)` for
-Rig's rolling compaction. Both run before every model request, including tool
-rounds. Errors stop the run instead of silently restoring oversized context.
+Use `context::ContextPolicy(recent)` as an agent hook with a Rig memory window
+such as `LastMessages(20)` or `TokenBudget::new(8_000)`, or
+`context::CompactingContext::new(recent, compactor)` for rolling compaction of
+everything before the window. Both run before every model request, including
+tool rounds. A window never starts on a result whose call it cut off. Errors
+stop the run instead of silently restoring oversized context.
 
 ```rust,ignore
-use rig_memory::SlidingWindowMemory;
+use rig_memory::recent::LastMessages;
 use rigloop::context::ContextPolicy;
 
 let agent = rig::agent::AgentBuilder::new(model)
     .preamble("Persistent application instructions")
-    .add_hook(ContextPolicy(SlidingWindowMemory::last_messages(20)))
+    .add_hook(ContextPolicy(LastMessages(20)))
     .build();
 ```
 
-The durable journal remains complete. The current prompt must survive unchanged
-and all retained tool calls must still have matching results. Put persistent
-application instructions in the agent's preamble; system messages in history
-are subject to the chosen policy. Budget the preamble, tools, summary and output
-headroom separately from the retained window.
+The durable journal remains complete. The current prompt must survive unchanged.
+Put persistent application instructions in the agent's preamble; system messages
+in history are subject to the chosen window. Budget the preamble, tools, summary
+and output headroom separately from the retained window.
 
-Implement Rig's async `Compactor` to choose the summarization prompt, model and
-artifact. [The compaction example](examples/durable_compaction.rs) demonstrates a
-custom prompt with a separate summarizer and output limit. The summary is a
+Implement `context::Compactor` to choose the summarization prompt, model and
+summary message; Rig's `rig_memory::Summarizer` can build the request.
+[The compaction example](examples/durable_compaction.rs) demonstrates a custom
+prompt with a separate summarizer and output limit. The summary is a
 process-local derived cache, rebuilt from the full journal on restart. A
-side-effectful compactor should deduplicate by conversation ID and input content.
+side-effectful compactor should deduplicate by conversation and input content.
 Use one `CompactingContext` instance per conversation; do not share an agent
 carrying that hook between conversations.
 
 Configure Anthropic caching on the Rig model before building the agent. The
-session preserves `with_automatic_caching`, `with_prompt_caching`,
-`with_automatic_caching_1h` and `with_static_prefix_cache_ttl`. Tests capture the
-actual streaming request and verify a one-hour tools/system prefix with either
-a manual or automatic conversation-tail marker. Arbitrary historical text-block
-breakpoints still require upstream provider support or a provider adapter.
+session preserves `Messages::with_prompt_caching`,
+`with_static_prefix_cache_ttl` and a request cache retention
+(`GenerationOptions::cache`), which hands the conversation-tail marker to
+Anthropic's automatic caching. Tests capture the actual streaming request and
+verify a one-hour tools/system prefix with either a manual or automatic
+conversation-tail marker. Arbitrary historical text-block breakpoints still
+require upstream provider support or a provider adapter.
 
 ## Deadlines, hooks and observations
 
@@ -158,19 +168,18 @@ retried or reported as successful. Async deadlines require cooperative futures;
 blocking synchronous hook/tool code must be offloaded by the application.
 
 Configured Rig hooks run before the final durability hook. Result rewrites are
-persisted in their accepted presentation. Results rejected by earlier hooks are
-unknown for recovery purposes; rejected output is not exposed. Ordinary hooks,
-skips, rewrites and repeat retries compose with the session.
+persisted in their accepted presentation. Ordinary hooks, skips, rewrites,
+repeat retries and Rig's malformed-argument feedback compose with the session.
 
-Rig 0.42 suppresses canonical callbacks for invalid-tool repair/skip recovery,
-and retry feedback can introduce uncheckpointed transcript records. Those paths
-are rejected before dispatch or the next model request; they need an upstream
-checkpoint extension. Rig conversation-memory loading/appending is disabled in
-the session because its append errors are logged rather than propagated. Use
-context hooks and the explicit `Store` transaction contract here.
+Rig 0.45 settles a turn repaired by invalid-tool-name recovery without its
+model-turn hooks, and retry feedback and run-start prompt rewrites change the
+transcript without a canonical checkpoint. Those paths are rejected before
+dispatch or the next model request; they need an upstream checkpoint extension.
+The session disables Rig's conversation memory, which saves once per finished
+run. Use context hooks and the explicit `Store` transaction contract here.
 
-`Event::Rig` forwards Rig stream items, and `Event::RigError` preserves structured
-runtime/provider errors. These are observations; use `Event::Committed` as the
+`Event::Rig` forwards Rig stream items, and `Event::RigError` preserves Rig's
+structured `PromptError`. These are observations; use `Event::Committed` as the
 durable boundary. Slow consumers cannot stall the session; `recv()` reports
 `Lagged` when the 1,024-event buffer overflows. Turn outcomes record structured
 finish reasons where Rig supplies them. Usage is `None` when metrics are missing
