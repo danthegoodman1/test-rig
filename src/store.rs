@@ -1,6 +1,6 @@
 //! Application-owned storage for one conversation. See [`Store`] for the contract.
 use crate::{Outcome, journal::validate_append};
-use rig::message::{Message, ToolResult};
+use rig::message::{CallId, Message, ToolResult};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -51,7 +51,7 @@ pub enum InboxStatus {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ToolKey {
     pub assistant_position: usize,
-    pub call_id: String,
+    pub call_id: CallId,
 }
 
 /// One append-only transaction. Its ID and payload must survive uncertain writes.
@@ -198,7 +198,7 @@ impl Store for MemoryStore {
         let inner = self.inner.clone();
         Box::pin(async move {
             let mut state = inner.lock().map_err(|_| "memory store poisoned")?;
-            if key.call_id != result.call.as_str() {
+            if key.call_id != result.call {
                 return Err("receipt key does not match result".into());
             }
             if let Some(existing) = state.snapshot.tool_results.get(&key) {

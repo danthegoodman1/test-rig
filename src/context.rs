@@ -1,45 +1,39 @@
-//! Thin, fallible integration with Rig memory policies. Custom async compaction
-//! can use `AgentHook::on_completion_call`, `Compactor` and `RequestPatch` directly.
+//! Request-only context views over Rig's memory windows. Each hook patches what
+//! one model request sends, including tool rounds; the durable journal is untouched.
 use crate::validate_history;
 use rig::{
-    agent::{
-        AgentHook,
-        hook::{CompletionCall, CompletionCallAction, HookContext, RequestPatch},
-    },
+    agent::{AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, RequestPatch},
     message::Message,
 };
-use rig_memory::MemoryPolicy;
+use rig_memory::recent::{Recent, view};
+use std::{error::Error as StdError, future::Future, sync::Arc};
+use tokio::sync::Mutex;
 
-/// Apply a Rig memory policy at every model request, including tool rounds.
-/// The current prompt must survive unchanged; the durable journal is untouched.
-/// Policies must budget for the preamble, tools and output headroom separately.
-pub struct ContextPolicy<P>(pub P);
-impl<P: MemoryPolicy> AgentHook for ContextPolicy<P> {
+/// Send only the newest messages a Rig [`Recent`] rule keeps, such as
+/// `LastMessages(20)` or `TokenBudget::new(8_000)`. The window never starts on
+/// a result whose call it cut off. The current prompt must survive. Budget the
+/// preamble, tools and output headroom separately.
+pub struct ContextPolicy<R>(pub R);
+impl<R: Recent> AgentHook for ContextPolicy<R> {
     async fn on_completion_call(
         &self,
         _: &HookContext,
-        event: CompletionCall<'_>,
+        event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
-        let mut messages = event.history.to_vec();
-        messages.push(event.prompt.clone());
-        match self.0.apply(messages).and_then(|mut messages| {
-            validate_history(&messages)
-                .map_err(|e| rig_memory::MemoryError::Internal(e.to_string()))?;
-            if messages.pop().as_ref() != Some(event.prompt) {
-                return Err(rig_memory::MemoryError::Internal(
-                    "context policy must retain the current prompt unchanged".into(),
-                ));
+        let messages = request_messages(&event);
+        match view(&messages, &self.0).split_last() {
+            Some((_, history)) => {
+                CompletionCallAction::Patch(RequestPatch::new().history(history.to_vec()))
             }
-            Ok(messages)
-        }) {
-            Ok(history) => CompletionCallAction::Patch(RequestPatch::new().history(history)),
-            Err(error) => CompletionCallAction::Stop(format!("context policy: {error}")),
+            None => CompletionCallAction::Stop(
+                "context policy: the window must retain the current prompt".into(),
+            ),
         }
     }
 }
 
-/// Validate a custom compactor's request view before returning its history patch.
-/// Useful for async hooks that implement application-specific summary persistence.
+/// Validate a custom context view before returning its history patch.
+/// Useful for async hooks that implement application-specific summaries.
 pub fn history_patch(
     history: Vec<Message>,
     prompt: &Message,
@@ -50,83 +44,90 @@ pub fn history_patch(
     Ok(RequestPatch::new().history(history))
 }
 
-use rig::wasm_compat::WasmBoxedFuture;
-use rig_memory::{CompactingMemory, Compactor, ConversationMemory, MemoryError};
-use std::sync::{Arc, Mutex};
-
-/// Rig's rolling compaction adapter, applied before each request rather than
-/// only on session load. Create one instance per conversation; do not share an
-/// agent carrying this hook between conversations.
-///
-/// Summary state is a derived, process-local cache. A fresh instance rebuilds
-/// it from the full journal on restart. Side-effectful compactors should
-/// deduplicate by conversation ID and input content, as Rig's `Compactor`
-/// contract requires. Bound the summary separately from the retained window.
-pub struct CompactingContext<P, C: Compactor> {
-    conversation_id: String,
-    source: ContextSource,
-    memory: CompactingMemory<ContextSource, P, C>,
+/// Summarizes messages as they leave the request window.
+pub trait Compactor: Send + Sync {
+    /// Fold `evicted`, oldest first, into the `previous` summary and return
+    /// the new summary message.
+    fn compact(
+        &self,
+        evicted: &[Message],
+        previous: Option<&Message>,
+    ) -> impl Future<Output = Result<Message, Box<dyn StdError + Send + Sync>>> + Send;
 }
-impl<P: MemoryPolicy, C: Compactor> CompactingContext<P, C> {
-    pub fn new(conversation_id: impl Into<String>, policy: P, compactor: C) -> Self {
-        let source = ContextSource::default();
+
+/// Rolling compaction: a summary of everything before a [`Recent`] window,
+/// followed by the window. Create one instance per conversation; do not share
+/// an agent carrying this hook between conversations.
+///
+/// The summary is a derived, process-local cache. A fresh instance rebuilds it
+/// from the full journal on restart. Side-effectful compactors should
+/// deduplicate by conversation and input content. Bound the summary separately
+/// from the retained window.
+pub struct CompactingContext<R, C> {
+    recent: R,
+    compactor: C,
+    /// How many leading messages the summary covers, and the summary.
+    summary: Mutex<Option<(usize, Message)>>,
+}
+impl<R: Recent, C: Compactor> CompactingContext<R, C> {
+    pub fn new(recent: R, compactor: C) -> Self {
         Self {
-            conversation_id: conversation_id.into(),
-            memory: CompactingMemory::new(source.clone(), policy, compactor),
-            source,
+            recent,
+            compactor,
+            summary: Mutex::new(None),
         }
     }
 }
-impl<P: MemoryPolicy, C: Compactor> AgentHook for CompactingContext<P, C> {
+impl<R: Recent, C: Compactor> AgentHook for CompactingContext<R, C> {
     async fn on_completion_call(
         &self,
         _: &HookContext,
-        event: CompletionCall<'_>,
+        event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
-        let mut messages = event.history.to_vec();
-        messages.push(event.prompt.clone());
-        // Release the synchronous lock before compaction/LLM IO.
-        *self.source.0.lock().expect("context source poisoned") = messages;
-        match self
-            .memory
-            .load(&self.conversation_id)
-            .await
-            .and_then(|mut messages| {
-                if messages.pop().as_ref() != Some(event.prompt) {
-                    return Err(MemoryError::Internal(
-                        "compaction must retain the current prompt unchanged".into(),
-                    ));
-                }
-                history_patch(messages, event.prompt)
-                    .map_err(|e| MemoryError::Internal(e.to_string()))
-            }) {
+        let messages = request_messages(&event);
+        let start = messages.len() - view(&messages, &self.recent).len();
+        let mut summary = self.summary.lock().await;
+        // The journal only grows; a shorter one is another conversation.
+        if summary
+            .as_ref()
+            .is_some_and(|(covered, _)| *covered > messages.len())
+        {
+            *summary = None;
+        }
+        let covered = summary.as_ref().map_or(0, |(covered, _)| *covered);
+        if start > covered {
+            let evicted: Vec<Message> = messages[covered..start]
+                .iter()
+                .map(|m| (**m).clone())
+                .collect();
+            let previous = summary.as_ref().map(|(_, message)| message);
+            match self.compactor.compact(&evicted, previous).await {
+                Ok(message) => *summary = Some((start, message)),
+                Err(error) => return CompletionCallAction::Stop(format!("compaction: {error}")),
+            }
+        }
+        let start = start.max(covered);
+        if start == messages.len() {
+            return CompletionCallAction::Stop(
+                "compaction: the window must retain the current prompt".into(),
+            );
+        }
+        let window = &messages[start..messages.len() - 1];
+        let history = summary
+            .as_ref()
+            .map(|(_, message)| message.clone())
+            .into_iter()
+            .chain(window.iter().map(|m| (**m).clone()))
+            .collect();
+        match history_patch(history, event.prompt) {
             Ok(patch) => CompletionCallAction::Patch(patch),
             Err(error) => CompletionCallAction::Stop(format!("compaction: {error}")),
         }
     }
 }
 
-// Read-only request input for upstream CompactingMemory. No duplicate durable
-// store, append path or custom summary/watermark state machine.
-#[derive(Clone, Default)]
-struct ContextSource(Arc<Mutex<Vec<Message>>>);
-impl ConversationMemory for ContextSource {
-    fn load<'a>(&'a self, _: &'a str) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>> {
-        Box::pin(async move {
-            self.0
-                .lock()
-                .map(|m| m.clone())
-                .map_err(|_| MemoryError::Internal("context source poisoned".into()))
-        })
-    }
-    fn append<'a>(
-        &'a self,
-        _: &'a str,
-        _: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
-        Box::pin(async { Err(MemoryError::Internal("context source is read-only".into())) })
-    }
-    fn clear<'a>(&'a self, _: &'a str) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
-        Box::pin(async { Err(MemoryError::Internal("context source is read-only".into())) })
-    }
+fn request_messages(event: &CompletionCallEvent<'_>) -> Vec<Arc<Message>> {
+    let mut messages = event.history.to_vec();
+    messages.push(Arc::new(event.prompt.clone()));
+    messages
 }

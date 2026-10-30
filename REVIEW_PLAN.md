@@ -2,10 +2,10 @@
 
 ## Overarching goal
 
-Keep one small durable session around Rig 0.42's native runner. Preserve provider
+Keep one small durable session around Rig 0.45's native runner. Preserve provider
 ordering, accepted tool results and atomic transcript/inbox ACKs. Use upstream
-context policies and compaction; keep recovery and uncertain-write reconciliation
-caller-owned. The chosen implementation is complete within the boundary below.
+memory windows and pairing rules; keep recovery and uncertain-write
+reconciliation caller-owned. The chosen implementation is complete within the boundary below.
 
 The review baseline was `29474e14876e1be51a8cfbef4b8deab30c9b6dad` (Rig 0.38.2).
 [REVIEW_EVIDENCE.md](REVIEW_EVIDENCE.md) retains its ten failing probes.
@@ -15,16 +15,19 @@ benchmark results and limits. No release or deployment is part of this plan.
 ## Implementation principles
 
 - One actor owns queues and journal positions; idle never replaces the actor.
-- Commit canonical assistant messages from Rig hooks, never streamed deltas.
+- Commit canonical assistant messages from Rig hooks and tool batches from Rig's
+  committed history, never streamed deltas.
 - Keep the durable journal separate from the next model request's context view.
 - Preserve accepted results individually. A rejected/unobserved tool completion
   remains unknown; never automatically replay side effects.
 - Use immutable commit identities, expected append positions and explicit ACKs.
 - Bound awaited storage; report uncertain writes instead of assuming rollback.
-- Use native hooks and memory policies; remove superseded APIs and state machines.
+- Use native hooks, memory windows and pairing rules; remove superseded APIs and
+  state machines.
 
-The explicit upstream fallback is to reject invalid-tool recovery or retry
-feedback when Rig omits canonical checkpoints. The configured runner remains the
+The explicit upstream fallback is to reject invalid-tool-name recovery, retry
+feedback and run-start prompt rewrites, which change Rig's transcript without a
+canonical checkpoint. The configured runner remains the
 only execution implementation. Summary state is a rebuildable cache; tools run
 serially; the store has one active writer per conversation. Arbitrary historical
 Anthropic cache markers remain a provider extension, while standard cache
@@ -60,7 +63,7 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Decision | 0A: Guarantee and ownership table | README defines journal/request validity, ACK semantics, accepted results, deadlines and single-writer ownership. |
 | Complete | Work | 0B: Rig execution integration spike | Native runner integration in `src/session.rs`; grouped calls, interrupted siblings, rewritten results, rejected attempts and unsupported-recovery tests in `src/tests.rs`. |
-| Complete | Work | 0C: Memory version/policy spike | Cargo.lock resolves Rig/core/agent/memory 0.42.0; policy and compactor integration tests pass. |
+| Complete | Work | 0C: Memory version/policy spike | Cargo.lock resolves Rig/core/agent/memory 0.45.0; window and compactor integration tests pass. |
 | Complete | Doc | 0D: Deletion map and public API | Removed four custom runtime modules; README documents the session and store APIs. |
 | Complete | Test | 0T: Integration scenarios | `anthropic_cache_controls_reach_the_session_wire_request`, canonical/identity tests and `cargo tree -i rig-core`. |
 | Complete | Gate | 0G: Select one route | Configured AgentRunner + last durability hook; unsupported recovered turns fail before dispatch/next request. No hand-driven alternate engine. |
@@ -169,15 +172,15 @@ Status ledger:
 
 Goal: Resolve F8 through request-only context and delta-based bookkeeping.
 
-Scope: Direct fallible MemoryPolicy adapter and native CompactingMemory;
-application Compactor prompts; retained preamble; bounded intake; snapshots only
-on request; no per-checkpoint journal-prefix scans/copies.
+Scope: Request-only hooks over Rig memory windows (`recent::view`) and a rolling
+application `Compactor`; retained preamble; bounded intake; snapshots only on
+request; no per-checkpoint journal-prefix scans/copies.
 
 Completion gate: Context shrinks within the same session/tool loop without
 rewriting the journal or dropping accepted work. Bookkeeping stays independent
 of retained transcript length for a fixed append.
 
-Testing plan: Intra-tool policies, policy errors, custom compactor/restart,
+Testing plan: Intra-tool windows, prompt-retention errors, custom compactor/restart,
 queued work during compaction, captured Anthropic cache bodies and a release
 benchmark at 100/1,000/10,000 messages with 64/4,096-byte bodies.
 
@@ -186,11 +189,38 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Work | 5A: Distinct context view and policy boundary | ContextPolicy and CompactingContext use RequestPatch::history; first/intra-loop request and unchanged-journal tests. |
-| Complete | Work | 5B: Upstream policy integration | Custom Compactor example/test, restart rebuild, preamble preservation, policy failure and Anthropic cache wire fixtures. |
+| Complete | Work | 5B: Upstream policy integration | Custom Compactor example/test, restart rebuild, preamble preservation, prompt-retention failure and Anthropic cache wire fixtures. |
 | Complete | Work | 5C: Delta bookkeeping/bounded intake | Position-based commits, indexed store IDs, overload tests; no full-prefix checkpointer. |
 | Complete | Doc | 5D: Session compaction/restart examples | Both examples execute successfully; library doctest compiles; README explains context budgets and caller-owned restart. |
-| Complete | Test | 5T: Selected context/scaling matrix | 36 behavioral tests and isolated release bookkeeping probe; measurements and limits in IMPLEMENTATION_EVIDENCE. |
-| Complete | Gate | 5G: Smaller implementation with bounded context | About 63% fewer production source lines; fixed-append measurements remain near-flat as history grows. |
+| Complete | Test | 5T: Selected context/scaling matrix | Behavioral tests and isolated release bookkeeping probe; measurements and limits in IMPLEMENTATION_EVIDENCE. |
+| Complete | Gate | 5G: Smaller implementation with bounded context | About 62% fewer production source lines; fixed-append measurements remain near-flat as history grows. |
+
+## Phase 6: Rig 0.45
+
+Goal: Run on Rig 0.45 with the same session contracts and no looser history rules.
+
+Scope: Port hooks to `on_dispatch`/`on_outcome`; record each assistant turn with
+Rig's origin and stop; commit tool batches from Rig's committed results; check the
+journal against Rig's transcript before each request and after each run; validate
+result batches with Rig's `pairing::answers`; move context hooks onto
+`rig_memory::recent`.
+
+Completion gate: All earlier behavior tests pass; the journal equals Rig's
+transcript for every completed run; standard checks pass.
+
+Testing plan: Existing matrix plus hook skips, malformed tool arguments, split and
+mixed result batches, and captured Anthropic cache bodies on the 0.45 wire.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 6A: Hook and type port | `DurableHook` in session.rs; `CallId` receipt keys; `PromptError` classification. |
+| Complete | Work | 6B: Batches from committed history | `Actor::committed_result`; `hook_skip_commits_rigs_skipped_result`, `malformed_tool_arguments_commit_rigs_feedback_result`. |
+| Complete | Work | 6C: Transcript agreement | `Checkpoint::BeforeRequest` tail check and final-transcript comparison in `Actor::turn`; every run-completing test exercises it. |
+| Complete | Work | 6D: Strict journal on Rig pairing | `journal::validate`; `validator_rejects_orphans_duplicates_split_and_mixed_batches`. |
+| Complete | Work | 6E: Context hooks on rig-memory 0.45 | `ContextPolicy<R: Recent>`, `CompactingContext::new(recent, compactor)`, rigloop `Compactor` trait; compaction tests and example. |
+| Complete | Gate | 6G: Rig 0.45 parity | 38 behavioral tests, doctest, both examples, fmt and strict Clippy pass. |
 
 ## Deliberate non-goals and remaining upstream limits
 
@@ -198,6 +228,7 @@ No database driver, automatic journal loading, side-effect retries, durable summ
 state machine, concurrent tools or multi-writer fencing.
 A larger allocation/retention and end-to-end provider benchmark remains optional
 profiling work; the measured claim is limited to append bookkeeping. Native Rig
-request/history ownership still incurs its own costs. Invalid-tool recovery,
-retry feedback without canonical callbacks and arbitrary historical text-cache
-markers require an upstream extension before this session can support them.
+request/history ownership still incurs its own costs. Invalid-tool-name
+recovery, retry feedback, run-start prompt rewrites and arbitrary historical
+text-cache markers require an upstream extension before this session can support
+them.

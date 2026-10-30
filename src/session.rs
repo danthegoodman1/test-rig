@@ -5,20 +5,19 @@ use crate::{
 use futures::{FutureExt, StreamExt};
 use rig::{
     agent::{
-        Agent, AgentHook, MultiTurnStreamItem, StreamingError,
-        hook::{
-            CompletionCall, CompletionCallAction, HookContext, ModelTurnAction, ModelTurnFinished,
-            ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
-        },
+        Agent, AgentHook, CompletionCallAction, CompletionCallEvent, DispatchAction, DispatchEvent,
+        HookContext, ModelTurnAction, ModelTurnFinished, MultiTurnStreamItem, OutcomeAction,
+        OutcomeEvent, StepEventKind,
     },
     completion::{FinishReason, PromptError, Usage},
-    message::{Message, ToolResult, ToolResultContent, UserContent},
+    error::ErrorKind,
+    message::{AssistantMessage, CallId, Message, ToolResult, ToolResultContent, UserContent},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     panic::AssertUnwindSafe,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 use tokio::{
@@ -89,7 +88,7 @@ pub enum Error {
 #[derive(Clone, Debug)]
 pub enum Event {
     Rig(Arc<MultiTurnStreamItem>),
-    RigError(Arc<StreamingError>),
+    RigError(Arc<PromptError>),
     Committed(Arc<Commit>),
     Idle,
     Stopped(Result<EndReason, Error>),
@@ -134,7 +133,7 @@ impl Session {
         self.pending = pending;
         self
     }
-    /// Model-call budget per turn (default 1,000,000), overriding the agent default.
+    /// Total model-call budget per turn (default 1,000,000), overriding the agent default.
     pub fn max_turns(mut self, max: usize) -> Self {
         self.max_turns = max;
         self
@@ -247,7 +246,7 @@ impl SessionHandle {
             return Err(Error::Configuration("inbox ID must not be empty".into()));
         }
         let (tx, rx) = oneshot::channel();
-        self.send(Command::Submit(entry, tx)).await?;
+        self.send(Command::Submit(Box::new(entry), tx)).await?;
         self.reply(rx).await?
     }
     async fn signal(&self, kind: SignalKind, message: impl Into<Message>) -> Result<String, Error> {
@@ -320,7 +319,7 @@ impl SessionHandle {
 }
 
 enum Command {
-    Submit(InboxEntry, oneshot::Sender<Result<InboxStatus, Error>>),
+    Submit(Box<InboxEntry>, oneshot::Sender<Result<InboxStatus, Error>>),
     Resume(oneshot::Sender<Result<(), Error>>),
     Pause,
     Abort,
@@ -373,7 +372,10 @@ struct Actor {
     waiters: Vec<oneshot::Sender<Result<EndReason, Error>>>,
     paused: bool,
     loop_deadline: Option<Instant>,
-    receipts: BTreeMap<String, ToolResult>,
+    /// Durable receipts for the journal's trailing tool batch.
+    receipts: BTreeMap<CallId, ToolResult>,
+    /// Results Rig committed for that batch, awaiting the batch commit.
+    batch: BTreeMap<CallId, ToolResult>,
 }
 impl Actor {
     fn new(
@@ -401,6 +403,7 @@ impl Actor {
             paused: false,
             loop_deadline,
             receipts: BTreeMap::new(),
+            batch: BTreeMap::new(),
         }
     }
     fn emit(&self, event: Event) {
@@ -455,9 +458,10 @@ impl Actor {
         for call in calls {
             let key = ToolKey {
                 assistant_position: position,
-                call_id: call.id.to_string(),
+                call_id: call.id.clone(),
             };
-            let result = match self.receipts.remove(call.id.as_str()) {
+            let saved = self.batch.remove(&call.id);
+            let result = match saved.or_else(|| self.receipts.remove(&call.id)) {
                 Some(result) => Some(result),
                 None => timeout_at(deadline, self.config.store.load_tool_result(key))
                     .await
@@ -470,11 +474,9 @@ impl Actor {
                         message: e.to_string(),
                     })?,
             }
-            .unwrap_or(ToolResult {
-                call: call.id.clone(),
-                provider: call.provider.clone(),
-                name: call.function.name.clone(),
-                content: vec![ToolResultContent::text(RECOVERY)],
+            .unwrap_or_else(|| ToolResult {
+                is_error: true,
+                ..call.result(vec![ToolResultContent::text(RECOVERY)])
             });
             check_result(&call, &result)?;
             results.push(UserContent::ToolResult(result));
@@ -539,6 +541,7 @@ impl Actor {
     ) -> Result<Option<EndReason>, Error> {
         match command {
             Command::Submit(entry, reply) => {
+                let entry = *entry;
                 if self.queue.len() >= self.config.capacity && !self.queue.contains(&entry.id) {
                     let _ = reply.send(Err(Error::QueueFull));
                     return Ok(None);
@@ -612,30 +615,18 @@ impl Actor {
     }
     async fn checkpoint(&mut self, checkpoint: Checkpoint, deadline: Instant) -> Result<(), Error> {
         match checkpoint {
-            Checkpoint::BeforeRequest(expected_len) => {
-                if expected_len != self.config.history.len() {
-                    return Err(Error::InvalidHistory("Rig changed transcript without a canonical checkpoint; invalid-tool recovery and retry feedback require upstream checkpoint support".into()));
+            Checkpoint::BeforeRequest { len, tail } => {
+                if len != self.config.history.len() || !self.config.history.ends_with(&tail) {
+                    return Err(Error::InvalidHistory("Rig changed transcript without a canonical checkpoint; invalid-tool recovery, retry feedback and prompt rewrites require upstream checkpoint support".into()));
                 }
-                if self
-                    .config
-                    .history
-                    .last()
-                    .is_some_and(|m| !calls(m).is_empty())
-                {
-                    Err(Error::InvalidHistory(
-                        "Rig requested a new model turn before the durable tool batch completed"
-                            .into(),
-                    ))
-                } else {
-                    Ok(())
-                }
+                Ok(())
             }
             Checkpoint::BeforeTool(id) => {
                 if self
                     .config
                     .history
                     .last()
-                    .is_some_and(|m| calls(m).iter().any(|c| c.id.as_str() == id))
+                    .is_some_and(|m| calls(m).iter().any(|c| c.id == id))
                 {
                     Ok(())
                 } else {
@@ -644,26 +635,22 @@ impl Actor {
             }
             Checkpoint::Assistant(message) => {
                 self.receipts.clear();
+                self.batch.clear();
                 self.commit(vec![message], Vec::new(), None, deadline).await
             }
-            Checkpoint::Result { id, name, content } => {
-                let Some(last) = self.config.history.last() else {
-                    return Err(Error::InvalidHistory(
-                        "tool result before assistant checkpoint".into(),
-                    ));
-                };
-                let pending = calls(last);
-                let Some(call) = pending.iter().find(|call| call.id.as_str() == id) else {
+            Checkpoint::Receipt(id, outcome) => {
+                let Some(call) = self
+                    .config
+                    .history
+                    .last()
+                    .and_then(|last| calls(last).into_iter().find(|call| call.id == id))
+                else {
                     return Err(Error::InvalidHistory(
                         "tool result outside its pending assistant batch".into(),
                     ));
                 };
-                let result = ToolResult {
-                    call: call.id.clone(),
-                    provider: call.provider.clone(),
-                    name,
-                    content,
-                };
+                // The result Rig commits for this outcome.
+                let result = call.answer(&outcome);
                 let key = ToolKey {
                     assistant_position: self.config.history.len() - 1,
                     call_id: id.clone(),
@@ -688,23 +675,50 @@ impl Actor {
                     });
                 }
                 self.receipts.insert(id, result);
-                if self.receipts.len() == pending.len() {
-                    let results = pending
-                        .iter()
-                        .map(|c| UserContent::ToolResult(self.receipts[c.id.as_str()].clone()))
-                        .collect();
-                    self.commit(
-                        vec![Message::User { content: results }],
-                        Vec::new(),
-                        None,
-                        deadline,
-                    )
-                    .await?;
-                    self.receipts.clear();
-                }
                 Ok(())
             }
         }
+    }
+    /// Collect a result Rig committed for the trailing batch; once every call
+    /// is answered, commit the batch exactly as Rig holds it, in call order.
+    async fn committed_result(
+        &mut self,
+        result: ToolResult,
+        deadline: Instant,
+    ) -> Result<(), Error> {
+        let pending = self.config.history.last().map(calls).unwrap_or_default();
+        if !pending.iter().any(|call| call.id == result.call) {
+            return Err(Error::InvalidHistory(
+                "Rig committed a tool result outside the durable assistant batch".into(),
+            ));
+        }
+        if self
+            .receipts
+            .get(&result.call)
+            .is_some_and(|receipt| receipt != &result)
+        {
+            return Err(Error::InvalidHistory(
+                "Rig committed a tool result that differs from its durable receipt".into(),
+            ));
+        }
+        self.batch.insert(result.call.clone(), result);
+        let Some(content) = pending
+            .iter()
+            .map(|call| {
+                self.batch
+                    .get(&call.id)
+                    .cloned()
+                    .map(UserContent::ToolResult)
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(());
+        };
+        self.commit(vec![Message::User { content }], Vec::new(), None, deadline)
+            .await?;
+        self.receipts.clear();
+        self.batch.clear();
+        Ok(())
     }
     async fn turn(&mut self, entries: Vec<InboxEntry>) -> Result<EndReason, Error> {
         let turn_deadline = self.config.turn_timeout.map(|d| Instant::now() + d);
@@ -726,21 +740,22 @@ impl Actor {
         let Some((prompt, history)) = self.config.history.split_last() else {
             return Err(Error::InvalidHistory("cannot run empty history".into()));
         };
+        // Rig's transcript for this run starts with the prompt.
+        let run_start = history.len();
         let (check_tx, mut check_rx) = mpsc::channel(1);
         let mut stream = self
             .config
             .agent
-            .runner(prompt.clone())
+            .prompt(prompt.clone())
             .history(history.to_vec())
             .without_memory()
             .max_turns(self.config.max_turns)
-            .add_hook(DurableHook(check_tx))
-            .stream()
-            .await;
-        let mut usage = Usage::new();
-        let mut usage_known = true;
-        let mut calls_seen = 0;
-        let mut finish_reason = None;
+            .add_hook(DurableHook {
+                checkpoints: check_tx,
+                head: Mutex::default(),
+            })
+            .stream();
+        let mut usage = None;
         let reason = loop {
             // A delivered durable checkpoint wins over cancellation: it is a
             // completed boundary and must either persist or report uncertainty.
@@ -768,19 +783,31 @@ impl Actor {
                     match item {
                         Some(Ok(item)) => {
                             match &item {
-                                MultiTurnStreamItem::CompletionCall(call) => { calls_seen += 1; usage_known &= call.usage.has_values(); usage += call.usage; }
-                                MultiTurnStreamItem::FinalResponse(_) => { self.emit_rig(item); break finish_reason.unwrap_or(EndReason::Completed); }
+                                // Rig yields a batch's results after committing them
+                                // and before its next model request.
+                                MultiTurnStreamItem::ToolResult { tool_result, .. } => {
+                                    self.committed_result(tool_result.clone(), self.io_deadline(deadline)).await?;
+                                }
+                                MultiTurnStreamItem::FinalResponse(response) => {
+                                    if response.messages[..] != self.config.history[run_start..] {
+                                        return Err(Error::InvalidHistory("Rig's transcript diverged from the durable journal".into()));
+                                    }
+                                    let calls = &response.completion_calls;
+                                    usage = (!calls.is_empty() && calls.iter().all(|c| c.usage.is_reported())).then_some(response.usage);
+                                    let reason = match calls.last().and_then(|c| c.finish_reason.as_ref()) {
+                                        Some(FinishReason::Length) => EndReason::Length,
+                                        Some(FinishReason::ContentFilter) => EndReason::ContentFilter,
+                                        _ => EndReason::Completed,
+                                    };
+                                    self.emit_rig(item);
+                                    break reason;
+                                }
                                 _ => {}
-                            }
-                            // Canonical finish reason is carried by the boundary hook
-                            // via the stream's completion-call accounting below.
-                            if let MultiTurnStreamItem::CompletionCall(call) = &item {
-                                finish_reason = call.finish_reason.as_ref().and_then(|r| match r { FinishReason::Length => Some(EndReason::Length), FinishReason::ContentFilter => Some(EndReason::ContentFilter), _ => None });
                             }
                             self.emit_rig(item);
                         }
-                        Some(Err(error)) => { usage_known = false; let reason = classify(&error); self.emit(Event::RigError(Arc::new(error))); break reason; }
-                        None => { usage_known = false; break EndReason::ProviderError("Rig stream ended without a final response".into()); }
+                        Some(Err(error)) => { let reason = classify(&error); self.emit(Event::RigError(Arc::new(error))); break reason; }
+                        None => break EndReason::ProviderError("Rig stream ended without a final response".into()),
                     }
                 }
             }
@@ -799,7 +826,7 @@ impl Actor {
         let outcome = Outcome {
             run_id: Uuid::new_v4(),
             reason: reason.clone(),
-            usage: (usage_known && calls_seen > 0).then_some(usage),
+            usage,
             finished_at: SystemTime::now(),
         };
         self.commit(Vec::new(), Vec::new(), Some(outcome), finalization)
@@ -807,9 +834,11 @@ impl Actor {
         Ok(reason)
     }
 }
+// Lives for one select iteration; boxing would allocate for every stream item.
+#[allow(clippy::large_enum_variant)]
 enum Next {
     Command(Option<Command>),
-    Item(Option<Result<MultiTurnStreamItem, StreamingError>>),
+    Item(Option<Result<MultiTurnStreamItem, PromptError>>),
 }
 async fn wait_deadline(deadline: Option<Instant>) {
     match deadline {
@@ -817,45 +846,70 @@ async fn wait_deadline(deadline: Option<Instant>) {
         None => std::future::pending().await,
     }
 }
-fn classify(error: &StreamingError) -> EndReason {
+fn classify(error: &PromptError) -> EndReason {
     match error {
-        StreamingError::Prompt(error) => match error.as_ref() {
-            PromptError::MaxTurnsError { .. } => EndReason::MaxTurns,
-            PromptError::PromptCancelled { reason, .. } => EndReason::HookStopped(reason.clone()),
-            PromptError::CompletionError(error) => EndReason::ProviderError(error.to_string()),
-            other => EndReason::RunError(other.to_string()),
-        },
-        other => EndReason::ProviderError(other.to_string()),
+        PromptError::MaxTurns { .. } => EndReason::MaxTurns,
+        PromptError::Cancelled { reason, .. } => EndReason::HookStopped(reason.clone()),
+        PromptError::Provider(error) => EndReason::ProviderError(error.to_string()),
+        PromptError::Report(report)
+            if matches!(
+                report.kind,
+                ErrorKind::Http
+                    | ErrorKind::Request
+                    | ErrorKind::Response
+                    | ErrorKind::Provider
+                    | ErrorKind::ProviderResponse
+            ) =>
+        {
+            EndReason::ProviderError(report.to_string())
+        }
+        other => EndReason::RunError(other.to_string()),
     }
 }
 
 enum Checkpoint {
-    BeforeRequest(usize),
-    BeforeTool(String),
-    Assistant(Message),
-    Result {
-        id: String,
-        name: String,
-        content: Vec<ToolResultContent>,
+    /// Rig's transcript length and its last two messages before a request.
+    BeforeRequest {
+        len: usize,
+        tail: Vec<Message>,
     },
+    BeforeTool(CallId),
+    Assistant(Message),
+    Receipt(CallId, rig::tool::ToolResult),
 }
-struct DurableHook(mpsc::Sender<(Checkpoint, oneshot::Sender<()>)>);
+struct DurableHook {
+    checkpoints: mpsc::Sender<(Checkpoint, oneshot::Sender<()>)>,
+    /// The accepted completion's origin and stop, which `ModelTurnFinished`
+    /// omits. Rig closes a completion's outcome just before finishing its turn.
+    head: Mutex<Option<AssistantMessage>>,
+}
 impl DurableHook {
     async fn checkpoint(&self, checkpoint: Checkpoint) -> bool {
         let (tx, rx) = oneshot::channel();
-        self.0.send((checkpoint, tx)).await.is_ok() && rx.await.is_ok()
+        self.checkpoints.send((checkpoint, tx)).await.is_ok() && rx.await.is_ok()
     }
 }
 impl AgentHook for DurableHook {
+    fn observes(&self, kind: StepEventKind) -> bool {
+        matches!(
+            kind,
+            StepEventKind::CompletionCall
+                | StepEventKind::ModelTurnFinished
+                | StepEventKind::CompletionDispatch
+                | StepEventKind::ToolDispatch
+        )
+    }
     async fn on_completion_call(
         &self,
         _: &HookContext,
-        event: CompletionCall<'_>,
+        event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
-        if self
-            .checkpoint(Checkpoint::BeforeRequest(event.history.len() + 1))
-            .await
-        {
+        let tail = event.history.last().map(|m| (**m).clone());
+        let checkpoint = Checkpoint::BeforeRequest {
+            len: event.history.len() + 1,
+            tail: tail.into_iter().chain([event.prompt.clone()]).collect(),
+        };
+        if self.checkpoint(checkpoint).await {
             CompletionCallAction::Continue
         } else {
             CompletionCallAction::Stop("session stopped".into())
@@ -866,43 +920,45 @@ impl AgentHook for DurableHook {
         _: &HookContext,
         event: ModelTurnFinished<'_>,
     ) -> ModelTurnAction {
-        let message = Message::Assistant {
-            id: event.identity.message_id.clone(),
-            content: event.content.clone(),
-        };
+        let head = self.head.lock().ok().and_then(|mut head| head.take());
+        let message =
+            Message::Assistant(head.unwrap_or_default().with_content(event.content.clone()));
         if self.checkpoint(Checkpoint::Assistant(message)).await {
             ModelTurnAction::Continue
         } else {
             ModelTurnAction::Stop("session stopped".into())
         }
     }
-    async fn on_tool_call(&self, _: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
-        let Some(id) = event.tool_call_id else {
-            return ToolCallAction::Stop("tool call has no ID".into());
+    async fn on_dispatch(&self, _: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+        if event.tool_name().is_none() {
+            return DispatchAction::Proceed;
+        }
+        let Some(id) = event.call_id else {
+            return DispatchAction::stop("tool call has no ID");
         };
-        if self.checkpoint(Checkpoint::BeforeTool(id.into())).await {
-            ToolCallAction::Run
+        if self.checkpoint(Checkpoint::BeforeTool(id.clone())).await {
+            DispatchAction::Proceed
         } else {
-            ToolCallAction::Stop("session stopped".into())
+            DispatchAction::stop("session stopped")
         }
     }
-    async fn on_tool_result(
-        &self,
-        _: &HookContext,
-        event: ToolResultEvent<'_>,
-    ) -> ToolResultAction {
-        let Some(id) = event.tool_call_id else {
-            return ToolResultAction::Stop("tool result has no call ID".into());
+    async fn on_outcome(&self, _: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        if let Some(response) = event.completion() {
+            if let Ok(mut head) = self.head.lock() {
+                *head = Some(response.head());
+            }
+            return OutcomeAction::Proceed;
+        }
+        let (Some(id), Some(result)) = (event.call_id, event.tool_result()) else {
+            return OutcomeAction::Proceed;
         };
-        let checkpoint = Checkpoint::Result {
-            id: id.into(),
-            name: event.tool_name.into(),
-            content: event.presentation.as_content().to_vec(),
-        };
-        if self.checkpoint(checkpoint).await {
-            ToolResultAction::Keep
+        if self
+            .checkpoint(Checkpoint::Receipt(id.clone(), result.clone()))
+            .await
+        {
+            OutcomeAction::Proceed
         } else {
-            ToolResultAction::Stop("session stopped".into())
+            OutcomeAction::stop("session stopped")
         }
     }
 }
